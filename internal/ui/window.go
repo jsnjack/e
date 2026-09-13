@@ -1,0 +1,760 @@
+package ui
+
+import (
+	"context"
+	"fmt"
+	"log/slog"
+	"os"
+	"path/filepath"
+	"sync"
+
+	"github.com/diamondburned/gotk4-adwaita/pkg/adw"
+	coreglib "github.com/diamondburned/gotk4/pkg/core/glib"
+	"github.com/diamondburned/gotk4/pkg/gdk/v4"
+	"github.com/diamondburned/gotk4/pkg/gio/v2"
+	"github.com/diamondburned/gotk4/pkg/glib/v2"
+	"github.com/diamondburned/gotk4/pkg/gtk/v4"
+	"github.com/jsnjack/e/internal/activity"
+	"github.com/jsnjack/e/internal/ai"
+	"github.com/jsnjack/e/internal/dispatch"
+	"github.com/jsnjack/e/internal/document"
+	"github.com/jsnjack/e/internal/logging"
+)
+
+type window struct {
+	app     *adw.Application
+	options Options
+
+	ctx    context.Context
+	cancel context.CancelFunc
+
+	win                 *adw.ApplicationWindow
+	toastOverlay        *adw.ToastOverlay
+	activityHub         *activity.Hub
+	activity            *activitySurface
+	tabs                *adw.TabView
+	tabBar              *adw.TabBar
+	title               *adw.WindowTitle
+	searchBar           *gtk.SearchBar
+	searchEntry         *gtk.SearchEntry
+	replaceEntry        *gtk.Entry
+	matchLabel          *gtk.Label
+	content             *gtk.Paned
+	sidebar             *gtk.ScrolledWindow
+	sidebarBody         *gtk.Box
+	sidebarToggle       *gtk.Button
+	sidebarWidth        int
+	projectRoot         string
+	pendingCtrlK        bool
+	preferences         *adw.PreferencesDialog
+	preferencesApplying bool
+
+	documents map[*adw.TabPage]*editorDocument
+	completer *ai.Completer
+	aiCancel  context.CancelFunc
+	restored  bool
+	mu        sync.Mutex
+}
+
+func newWindow(app *adw.Application, options Options) *window {
+	ctx, cancel := context.WithCancel(context.Background())
+	w := &window{
+		app: app, options: options, ctx: ctx, cancel: cancel,
+		documents: make(map[*adw.TabPage]*editorDocument),
+	}
+	w.build()
+	w.registerActions()
+	w.setCompleter(options.Completer)
+	return w
+}
+
+func (w *window) build() {
+	logging.Trace("ui: build window shell")
+	loadCSS()
+	w.win = adw.NewApplicationWindow(&w.app.Application)
+	w.win.AddCSSClass("e-window")
+	w.win.SetTitle("E")
+	w.win.SetDefaultSize(1100, 760)
+	w.win.Connect("notify::is-active", func() {
+		logging.Trace("ui: window focus changed", "active", w.win.IsActive(), "preferences", w.preferences != nil)
+	})
+	logging.Trace("ui: application window ready")
+
+	header := adw.NewHeaderBar()
+	w.title = adw.NewWindowTitle("E", "A fast, focused editor")
+	header.SetTitleWidget(w.title)
+	w.activityHub = activity.NewHub()
+	w.activity = newActivitySurface(w.activityHub)
+
+	open := gtk.NewButtonFromIconName("document-open-symbolic")
+	open.SetTooltipText("Open File")
+	open.ConnectClicked(w.chooseOpen)
+	header.PackStart(open)
+
+	newButton := gtk.NewButtonFromIconName("document-new-symbolic")
+	newButton.SetTooltipText("New Document")
+	newButton.ConnectClicked(func() { w.newDocument(nil) })
+	header.PackStart(newButton)
+
+	w.sidebarToggle = gtk.NewButtonFromIconName("sidebar-show-symbolic")
+	w.sidebarToggle.SetTooltipText("Show or hide project files")
+	w.sidebarToggle.SetVisible(false)
+	w.sidebarToggle.ConnectClicked(w.toggleSidebar)
+	header.PackStart(w.sidebarToggle)
+
+	menu := gio.NewMenu()
+	menu.Append("Command Palette…", "win.command-palette")
+	menu.Append("Quick Open…", "win.quick-open")
+	menu.Append("Save As…", "win.save-as")
+	menu.Append("Find and Replace", "win.replace")
+	menu.Append("Markdown Preview", "win.markdown-preview")
+	menu.Append("Transform Selection with AI…", "win.ai-transform")
+	menu.Append("Preferences", "win.preferences")
+	menu.Append("Keyboard Shortcuts", "win.shortcuts")
+	menu.Append("About E", "win.about")
+	menuButton := gtk.NewMenuButton()
+	menuButton.SetIconName("open-menu-symbolic")
+	menuButton.SetMenuModel(menu)
+	header.PackEnd(menuButton)
+
+	searchButton := gtk.NewButtonFromIconName("edit-find-symbolic")
+	searchButton.SetTooltipText("Find")
+	searchButton.ConnectClicked(func() { w.showSearch(false) })
+	header.PackEnd(searchButton)
+
+	save := gtk.NewButtonFromIconName("document-save-symbolic")
+	save.SetTooltipText("Save")
+	save.ConnectClicked(w.saveActive)
+	header.PackEnd(save)
+	logging.Trace("ui: header ready")
+
+	w.tabs = adw.NewTabView()
+	w.tabBar = adw.NewTabBar()
+	w.tabBar.SetView(w.tabs)
+	w.tabBar.SetAutohide(true)
+	w.tabs.ConnectClosePage(w.closePage)
+	w.tabs.Connect("notify::selected-page", func() { w.updateTitle(w.active()) })
+	logging.Trace("ui: tabs ready")
+
+	w.searchBar = gtk.NewSearchBar()
+	w.searchBar.SetShowCloseButton(true)
+	w.searchEntry = gtk.NewSearchEntry()
+	w.searchEntry.SetPlaceholderText("Find")
+	w.replaceEntry = gtk.NewEntry()
+	w.replaceEntry.SetPlaceholderText("Replace with")
+	w.matchLabel = gtk.NewLabel("")
+	w.matchLabel.AddCSSClass("dim-label")
+	previous := gtk.NewButtonFromIconName("go-up-symbolic")
+	previous.SetTooltipText("Previous Match")
+	next := gtk.NewButtonFromIconName("go-down-symbolic")
+	next.SetTooltipText("Next Match")
+	replace := gtk.NewButtonWithLabel("Replace")
+	replaceAll := gtk.NewButtonWithLabel("Replace All")
+	row := gtk.NewBox(gtk.OrientationHorizontal, 6)
+	row.SetMarginStart(12)
+	row.SetMarginEnd(12)
+	row.SetMarginTop(6)
+	row.SetMarginBottom(6)
+	w.searchEntry.SetHExpand(true)
+	w.replaceEntry.SetHExpand(true)
+	row.Append(w.searchEntry)
+	row.Append(w.replaceEntry)
+	row.Append(w.matchLabel)
+	row.Append(previous)
+	row.Append(next)
+	row.Append(replace)
+	row.Append(replaceAll)
+	w.searchBar.SetChild(row)
+	w.searchBar.ConnectEntry(w.searchEntry)
+	w.searchBar.SetKeyCaptureWidget(&w.win.Widget)
+	w.replaceEntry.SetVisible(false)
+	w.searchEntry.ConnectSearchChanged(func() {
+		if doc := w.active(); doc != nil {
+			doc.search.update(w.searchEntry.Text())
+		}
+	})
+	w.searchEntry.ConnectNextMatch(func() { w.navigateMatch(1) })
+	w.searchEntry.ConnectPreviousMatch(func() { w.navigateMatch(-1) })
+	w.searchEntry.ConnectStopSearch(func() { w.searchBar.SetSearchMode(false) })
+	previous.ConnectClicked(func() { w.navigateMatch(-1) })
+	next.ConnectClicked(func() { w.navigateMatch(1) })
+	replace.ConnectClicked(func() {
+		if doc := w.active(); doc != nil {
+			doc.search.replaceCurrent(w.replaceEntry.Text())
+		}
+	})
+	replaceAll.ConnectClicked(func() {
+		if doc := w.active(); doc != nil {
+			doc.search.replaceAll(w.replaceEntry.Text())
+		}
+	})
+	logging.Trace("ui: search ready")
+
+	toolbar := adw.NewToolbarView()
+	toolbar.AddTopBar(header)
+	toolbar.AddTopBar(w.tabBar)
+	toolbar.AddTopBar(w.searchBar)
+	w.sidebarBody = gtk.NewBox(gtk.OrientationVertical, 0)
+	w.sidebar = gtk.NewScrolledWindow()
+	w.sidebar.SetPolicy(gtk.PolicyNever, gtk.PolicyAutomatic)
+	w.sidebar.SetMinContentWidth(160)
+	w.sidebar.SetChild(w.sidebarBody)
+	w.sidebar.SetVisible(false)
+	w.sidebarWidth = 260
+	w.content = gtk.NewPaned(gtk.OrientationHorizontal)
+	w.content.AddCSSClass("editor-content")
+	w.content.SetStartChild(w.sidebar)
+	w.content.SetEndChild(w.tabs)
+	w.content.SetResizeStartChild(false)
+	w.content.SetResizeEndChild(true)
+	w.content.SetShrinkStartChild(true)
+	w.content.SetShrinkEndChild(false)
+	w.content.SetWideHandle(true)
+	w.content.SetPosition(w.sidebarWidth)
+	toolbar.SetContent(w.content)
+	w.activity.mount(toolbar)
+	w.activity.subscribe(w.ctx)
+	w.toastOverlay = adw.NewToastOverlay()
+	w.toastOverlay.SetChild(toolbar)
+	w.win.SetContent(w.toastOverlay)
+	w.win.ConnectCloseRequest(func() bool {
+		w.persistSession()
+		return false
+	})
+	logging.Trace("ui: window shell ready")
+}
+
+func (w *window) registerActions() {
+	logging.Trace("ui: register actions")
+	w.action("new", func() { w.newDocument(nil) }, "<Control>n")
+	w.action("open", w.chooseOpen, "<Control>o")
+	w.action("command-palette", w.showCommandPalette, "<Control><Shift>p")
+	w.action("quick-open", w.showQuickOpen, "<Control>p")
+	w.action("save", w.saveActive, "<Control>s")
+	w.action("save-as", w.saveActiveAs, "<Control><Shift>s")
+	w.action("find", func() { w.showSearch(false) }, "<Control>f")
+	w.action("replace", func() { w.showSearch(true) }, "<Control>h")
+	w.action("markdown-preview", func() {
+		if doc := w.active(); doc != nil {
+			doc.toggleMarkdownPreview()
+		}
+	}, "<Control><Shift>v")
+	w.action("ai-transform", w.showAITransform)
+	w.action("undo", func() {
+		if doc := w.active(); doc != nil && doc.buffer.CanUndo() {
+			doc.buffer.Undo()
+		}
+	}, "<Control>z")
+	w.action("redo", func() {
+		if doc := w.active(); doc != nil && doc.buffer.CanRedo() {
+			doc.buffer.Redo()
+		}
+	}, "<Control><Shift>z", "<Control>y")
+	w.action("toggle-sidebar", w.toggleSidebar, "<Control>b")
+	w.action("show-sidebar", func() {
+		w.showSidebar()
+		w.sidebar.GrabFocus()
+	}, "<Control><Shift>e")
+	w.action("close-tab", func() {
+		if page := w.tabs.SelectedPage(); page != nil {
+			w.tabs.ClosePage(page)
+		}
+	}, "<Control>w")
+	w.action("complete", func() {
+		if doc := w.active(); doc != nil {
+			doc.requestCompletion(true)
+		}
+	}, "<Alt>backslash")
+	w.action("lsp-complete", func() {
+		if doc := w.active(); doc != nil {
+			doc.requestLSPCompletion()
+		}
+	}, "<Control>space")
+	w.action("select-next", func() {
+		if doc := w.active(); doc != nil {
+			doc.selectNextOccurrence()
+		}
+	}, "<Control>d")
+	w.action("select-all-occurrences", func() {
+		if doc := w.active(); doc != nil {
+			doc.selectAllOccurrences()
+		}
+	}, "<Control><Shift>l", "<Control>F2", "<Alt>Return")
+	w.action("next-tab", func() { w.selectRelativeTab(1) }, "<Control>Tab")
+	w.action("previous-tab", func() { w.selectRelativeTab(-1) }, "<Control><Shift>Tab")
+	w.action("find-next", func() { w.navigateMatch(1) }, "F3")
+	w.action("find-previous", func() { w.navigateMatch(-1) }, "<Shift>F3")
+	w.action("preferences", w.openPreferences, "<Control>comma")
+	w.action("shortcuts", w.showShortcuts)
+	w.action("about", w.showAbout)
+	keys := gtk.NewEventControllerKey()
+	keys.SetPropagationPhase(gtk.PhaseCapture)
+	keys.ConnectKeyPressed(w.keyPressed)
+	w.win.AddController(keys)
+	logging.Trace("ui: actions ready")
+}
+
+func (w *window) action(name string, fn func(), accelerators ...string) {
+	logging.Trace("ui: register action", "name", name)
+	action := gio.NewSimpleAction(name, nil)
+	action.ConnectActivate(func(*glib.Variant) { fn() })
+	w.win.AddAction(action)
+	var valid []string
+	for _, accelerator := range accelerators {
+		if _, _, ok := gtk.AcceleratorParse(accelerator); ok {
+			valid = append(valid, accelerator)
+		}
+	}
+	if len(valid) > 0 {
+		w.app.SetAccelsForAction("win."+name, valid)
+	}
+}
+
+func (w *window) keyPressed(keyval, _ uint, state gdk.ModifierType) bool {
+	lower := gdk.KeyvalToLower(keyval)
+	ctrl := state&gdk.ControlMask != 0
+	shift := state&gdk.ShiftMask != 0
+	alt := state&gdk.AltMask != 0
+	super := state&gdk.SuperMask != 0
+	if w.pendingCtrlK {
+		w.pendingCtrlK = false
+		if ctrl && !shift && !alt && !super && lower == gdk.KEY_s {
+			w.showShortcuts()
+			return true
+		}
+	}
+	if ctrl && !shift && !alt && !super && lower == gdk.KEY_k {
+		w.pendingCtrlK = true
+		return true
+	}
+	return false
+}
+
+func (w *window) toggleSidebar() {
+	if w.projectRoot == "" {
+		return
+	}
+	if w.sidebar.Visible() {
+		if width := w.content.Position(); width >= 160 {
+			w.sidebarWidth = width
+		}
+		w.sidebar.SetVisible(false)
+		return
+	}
+	w.showSidebar()
+}
+
+func (w *window) showSidebar() {
+	if w.projectRoot == "" {
+		return
+	}
+	w.sidebar.SetVisible(true)
+	w.content.SetPosition(max(w.sidebarWidth, 160))
+}
+
+func (w *window) selectRelativeTab(direction int) {
+	if w.tabs.NPages() < 2 || w.tabs.SelectedPage() == nil {
+		return
+	}
+	position := w.tabs.PagePosition(w.tabs.SelectedPage())
+	position = (position + direction + w.tabs.NPages()) % w.tabs.NPages()
+	w.tabs.SetSelectedPage(w.tabs.NthPage(position))
+}
+
+func (w *window) present() { w.win.Present() }
+
+func (w *window) stop() {
+	w.persistSession()
+	w.cancel()
+	if w.activity != nil {
+		w.activity.destroy()
+	}
+	for _, doc := range w.documents {
+		doc.close()
+	}
+}
+
+func (w *window) setCompleter(completer *ai.Completer) {
+	if w.aiCancel != nil {
+		w.aiCancel()
+		w.aiCancel = nil
+	}
+	w.completer = completer
+	if completer != nil {
+		ctx, cancel := context.WithCancel(w.ctx)
+		w.aiCancel = cancel
+		logging.Trace("ui: start autocomplete probes")
+		completer.Start(ctx)
+	}
+}
+
+func (w *window) restoreOrNew() {
+	logging.Trace("ui: restore session")
+	if w.restored || len(w.documents) > 0 {
+		return
+	}
+	w.restored = true
+	snapshots, err := document.LoadSession(w.options.Paths.StateDir)
+	if err != nil {
+		slog.Warn("restore session", "err", err)
+		w.toast("Couldn’t restore the previous session")
+	}
+	for i := range snapshots {
+		snapshot := snapshots[i]
+		w.newDocument(&snapshot)
+	}
+	if len(w.documents) == 0 {
+		w.newDocument(nil)
+	}
+	logging.Trace("ui: session ready", "documents", len(w.documents))
+}
+
+func (w *window) active() *editorDocument {
+	page := w.tabs.SelectedPage()
+	if page == nil {
+		return nil
+	}
+	return w.documentForPage(page)
+}
+
+func (w *window) documentForPage(page *adw.TabPage) *editorDocument {
+	if doc := w.documents[page]; doc != nil {
+		return doc
+	}
+	for stored, doc := range w.documents {
+		if sameTabPage(stored, page) {
+			return doc
+		}
+	}
+	return nil
+}
+
+func sameTabPage(first, second *adw.TabPage) bool {
+	if first == nil || second == nil {
+		return false
+	}
+	return coreglib.BaseObject(first).Native() == coreglib.BaseObject(second).Native()
+}
+
+func (w *window) pageAttached(page *adw.TabPage) bool {
+	for position := 0; position < w.tabs.NPages(); position++ {
+		if sameTabPage(w.tabs.NthPage(position), page) {
+			return true
+		}
+	}
+	return false
+}
+
+func (w *window) documentForPath(path string) (*editorDocument, *adw.TabPage) {
+	abs, err := filepath.Abs(path)
+	if err != nil {
+		return nil, nil
+	}
+	for stored, doc := range w.documents {
+		if doc.path == abs {
+			if w.pageAttached(doc.page) {
+				return doc, doc.page
+			}
+			doc.close()
+			delete(w.documents, stored)
+		}
+	}
+	return nil, nil
+}
+
+func (w *window) openPath(path string) {
+	if info, err := os.Stat(path); err == nil && info.IsDir() {
+		w.setProjectRoot(path)
+		return
+	}
+	if doc, page := w.documentForPath(path); doc != nil {
+		w.tabs.SetSelectedPage(page)
+		doc.view.Widget.GrabFocus()
+		return
+	}
+	doc := w.newDocument(nil)
+	doc.load(path)
+}
+
+func (w *window) chooseOpen() {
+	dialog := gtk.NewFileDialog()
+	dialog.SetTitle("Open File")
+	dialog.OpenMultipleTextFiles(w.ctx, &w.win.Window, func(result gio.AsyncResulter) {
+		_, files, err := dialog.OpenMultipleTextFilesFinish(result)
+		if err != nil || files == nil {
+			return
+		}
+		for index := uint(0); index < files.NItems(); index++ {
+			item := files.Item(index)
+			if item == nil {
+				continue
+			}
+			if file, ok := item.CastType(gio.GTypeFile).(*gio.File); ok {
+				w.openPath(file.Path())
+			}
+		}
+	})
+}
+
+func (w *window) saveActive() {
+	if doc := w.active(); doc != nil {
+		if doc.path == "" {
+			w.saveDocumentAs(doc)
+		} else {
+			doc.save(doc.path)
+		}
+	}
+}
+
+func (w *window) saveActiveAs() {
+	if doc := w.active(); doc != nil {
+		w.saveDocumentAs(doc)
+	}
+}
+
+func (w *window) saveDocumentAs(doc *editorDocument) {
+	w.saveDocumentAsThen(doc, nil)
+}
+
+func (w *window) saveDocumentAsThen(doc *editorDocument, after func(bool)) {
+	dialog := gtk.NewFileDialog()
+	dialog.SetTitle("Save Document")
+	dialog.SetInitialName(doc.title())
+	dialog.SaveTextFile(w.ctx, &w.win.Window, func(result gio.AsyncResulter) {
+		_, _, file, err := dialog.SaveTextFileFinish(result)
+		if err != nil || file == nil {
+			if after != nil {
+				after(false)
+			}
+			return
+		}
+		doc.saveThen(file.Path(), after)
+	})
+}
+
+func (w *window) closePage(page *adw.TabPage) bool {
+	doc := w.documentForPage(page)
+	if doc == nil {
+		return false
+	}
+	finish := func(close bool) {
+		if close {
+			doc.close()
+			delete(w.documents, doc.page)
+		}
+		w.tabs.ClosePageFinish(page, close)
+		if close && len(w.documents) == 0 {
+			w.newDocument(nil)
+		}
+	}
+	if !doc.buffer.Modified() {
+		finish(true)
+		return true
+	}
+	dialog := adw.NewAlertDialog("Save changes?", fmt.Sprintf("Changes to “%s” will be lost if you close it.", doc.title()))
+	dialog.AddResponse("cancel", "Cancel")
+	dialog.AddResponse("discard", "Discard")
+	dialog.AddResponse("save", "Save")
+	dialog.SetCloseResponse("cancel")
+	dialog.SetDefaultResponse("save")
+	dialog.SetResponseAppearance("discard", adw.ResponseDestructive)
+	dialog.SetResponseAppearance("save", adw.ResponseSuggested)
+	dialog.ConnectResponse(func(response string) {
+		switch response {
+		case "discard":
+			finish(true)
+		case "save":
+			if doc.path == "" {
+				w.saveDocumentAsThen(doc, finish)
+			} else {
+				doc.saveThen(doc.path, func(ok bool) { finish(ok) })
+			}
+		default:
+			finish(false)
+		}
+	})
+	dialog.Present(w.win)
+	return true
+}
+
+func (w *window) showSearch(replace bool) {
+	w.replaceEntry.SetVisible(replace)
+	w.searchBar.SetSearchMode(true)
+	w.searchEntry.GrabFocus()
+}
+
+func (w *window) navigateMatch(direction int) {
+	if doc := w.active(); doc != nil {
+		doc.search.navigate(direction)
+	}
+}
+
+func (w *window) toast(message string) {
+	toast := adw.NewToast(message)
+	toast.SetTimeout(3)
+	w.toastOverlay.AddToast(toast)
+}
+
+func (w *window) updateTitle(doc *editorDocument) {
+	w.activity.updateDocument(doc)
+	if doc == nil {
+		w.title.SetTitle("E")
+		w.title.SetSubtitle("")
+		return
+	}
+	w.title.SetTitle(doc.title())
+	w.title.SetSubtitle(doc.path)
+}
+
+func (w *window) persistSession() {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	snapshots := make([]document.Snapshot, 0, len(w.documents))
+	for index := 0; index < w.tabs.NPages(); index++ {
+		page := w.tabs.NthPage(index)
+		if doc := w.documentForPage(page); doc != nil && !doc.loading {
+			snapshots = append(snapshots, doc.snapshot())
+		}
+	}
+	if err := document.SaveSession(w.options.Paths.StateDir, snapshots); err != nil {
+		slog.Warn("save session", "err", err)
+	}
+}
+
+func loadCSS() {
+	provider := gtk.NewCSSProvider()
+	provider.LoadFromString(`
+.editor { font-family: monospace; font-size: 11pt; }
+.inline-completion { font-family: monospace; font-size: 11pt; }
+.search-count { min-width: 5em; }
+.secondary-caret { color: @accent_color; font-weight: bold; }
+.project-tree { padding: 4px; }
+.project-entry-row { border-radius: 6px; }
+.project-entry-open { padding: 5px 7px; border-radius: 6px; }
+.project-entry-menu { min-width: 28px; min-height: 28px; padding: 0; opacity: 0; }
+.project-entry-row:hover .project-entry-menu,
+.project-entry-menu:hover,
+.project-entry-menu:focus { opacity: 1; }
+.project-folder { padding: 5px 6px; }
+.project-folder image,
+.project-entry-open image { -gtk-icon-size: 18px; }
+.project-entry-label { font-weight: 400; }
+.project-folder .project-entry-label { font-weight: 500; }
+.status-bar {
+  min-height: 24px;
+  padding: 2px 7px 2px 10px;
+  background: @headerbar_bg_color;
+  border-top: 1px solid alpha(@window_fg_color, .10);
+  font-size: .88em;
+}
+.status-bar button { min-width: 24px; min-height: 22px; padding: 0 4px; }
+.status-position, .status-model { padding: 0 4px; }
+.e-window:backdrop .editor-content,
+.e-window:backdrop .editor,
+.e-window:backdrop .project-tree,
+.e-window:backdrop headerbar,
+.e-window:backdrop headerbar windowhandle,
+.e-window:backdrop tabbar,
+.e-window:backdrop tabbar .box,
+.e-window:backdrop tabbar .box > scrolledwindow {
+  filter: none;
+  opacity: 1;
+}
+.e-window:backdrop .editor-content,
+.e-window:backdrop .project-tree { color: @window_fg_color; }
+.e-window:backdrop headerbar,
+.e-window:backdrop tabbar { color: @headerbar_fg_color; }
+.activity-detail,
+.activity-log-detail { color: alpha(@window_fg_color, .62); font-size: .88em; }
+.activity-chip {
+  background: alpha(@accent_color, .14);
+  color: @accent_color;
+  border-radius: 999px;
+  padding: 1px 7px;
+  font-size: .82em;
+  font-weight: 600;
+}
+.activity-progress trough,
+.activity-progress progress { min-height: 3px; }
+.activity-log-row { padding: 6px; border-radius: 6px; }
+.activity-log-row:hover { background: alpha(@window_fg_color, .06); }
+.activity-log-row image.error,
+.status-bar image.error { color: @error_color; }
+`)
+	display := gdk.DisplayGetDefault()
+	if display != nil {
+		gtk.StyleContextAddProviderForDisplay(display, provider, gtk.STYLE_PROVIDER_PRIORITY_APPLICATION)
+	}
+}
+
+func (w *window) showAbout() {
+	about := adw.NewAboutDialog()
+	about.SetApplicationName("E")
+	about.SetApplicationIcon(appID)
+	about.SetDeveloperName("Yauhen Shulitski")
+	about.SetVersion(w.options.Version)
+	about.SetComments("A fast native text editor with AI autocomplete.")
+	about.SetLicenseType(gtk.LicenseMITX11)
+	about.Present(w.win)
+}
+
+func (w *window) showShortcuts() {
+	w.toast("Ctrl+B sidebar · Ctrl+F find · Alt+\\ AI · Ctrl+D next match · Alt+click or Shift+Alt+↑/↓ add cursor")
+}
+
+func (w *window) openPreferences() {
+	// Keep one owned dialog. Repeated Ctrl+, activations previously stacked
+	// modal layers, so closing the visible Preferences could leave the editor
+	// shaded by an older dialog.
+	if w.preferences != nil {
+		logging.Trace("ui: preferences already open")
+		return
+	}
+	logging.Trace("ui: open preferences", "active", w.win.IsActive())
+	dialog := w.buildPreferences()
+	w.preferences = dialog
+	dialog.ConnectClosed(func() {
+		logging.Trace("ui: preferences closed", "active", w.win.IsActive())
+		if w.preferences == dialog {
+			w.preferences = nil
+		}
+		dispatch.Main(func() {
+			// Run after AdwDialog has removed its modal host and shade.
+			if w.preferences == nil {
+				if doc := w.active(); doc != nil {
+					doc.view.Widget.GrabFocus()
+				}
+			}
+		})
+		glib.TimeoutAdd(250, func() bool {
+			// Ensure the first post-dialog frame cannot reuse a shaded snapshot.
+			// This is cheap and only runs after Preferences closes.
+			if w.preferences == nil {
+				w.win.QueueDraw()
+				w.content.QueueDraw()
+			}
+			return false
+		})
+	})
+	dialog.Present(w.win)
+}
+
+func boolOr(value *bool, fallback bool) bool {
+	if value == nil {
+		return fallback
+	}
+	return *value
+}
+
+func newlineFromConfig(value string, fallback document.Newline) document.Newline {
+	switch value {
+	case "lf":
+		return document.NewlineLF
+	case "crlf":
+		return document.NewlineCRLF
+	case "cr":
+		return document.NewlineCR
+	default:
+		return fallback
+	}
+}

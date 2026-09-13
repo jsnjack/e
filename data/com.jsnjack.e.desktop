@@ -1,0 +1,10 @@
+[Desktop Entry]
+Name=E
+Comment=Edit text and code with AI autocomplete
+Exec=e %F
+Icon=com.jsnjack.e
+Terminal=false
+Type=Application
+Categories=GNOME;GTK;Utility;TextEditor;
+MimeType=text/plain;text/markdown;application/json;application/xml;
+StartupNotify=true
