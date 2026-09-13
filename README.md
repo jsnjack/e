@@ -20,8 +20,9 @@ while adding inline AI and language-server completion.
 - Fuzzy Command Palette and asynchronous project Quick Open.
 - Live, side-by-side GitHub-flavored Markdown preview through WebKitGTK 6.
 
-Automatic AI suggestions are disabled by default and require an explicit,
-persisted consent in Preferences. When enabled, the default
+Automatic AI suggestions while typing are disabled by default and require an
+explicit, persisted consent in Preferences. A manual `Alt+\` request works
+independently and is itself an explicit, one-shot request. The default
 autocomplete order is `local-qwen` at a remote endpoint followed by
 `Gemma-4-E4B-it-GGUF` at Lemonade on `localhost:13305`. On first launch, E imports
 the ordered AI chain from Mailbox when available. Requests contain bounded text

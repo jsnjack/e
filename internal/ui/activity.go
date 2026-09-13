@@ -290,11 +290,6 @@ func (s *activitySurface) feed(event activity.Event) {
 		if event.Model != "" {
 			s.setServing(event.Model, event.Fallback)
 		}
-		if routineCompletion(event) && event.Phase == activity.Finished {
-			s.finish = nil
-			s.repaint()
-			return
-		}
 		s.finish = &event
 		s.repaint()
 	}
@@ -381,7 +376,7 @@ func (s *activitySurface) latestVisibleRunning() (*runningActivity, int) {
 	count := 0
 	for _, id := range s.order {
 		running := s.running[id]
-		if running == nil || routineCompletion(running.event) {
+		if running == nil {
 			continue
 		}
 		latest = running
@@ -426,10 +421,6 @@ func (s *activitySurface) setServing(model string, fallback bool) {
 	s.servingChip.SetVisible(fallback)
 	s.fallback.SetVisible(fallback)
 	s.refreshButtonState()
-}
-
-func routineCompletion(event activity.Event) bool {
-	return event.Kind == activity.AI && event.Label == "Generating suggestion"
 }
 
 func (s *activitySurface) refreshButtonState() {

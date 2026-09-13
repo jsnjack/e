@@ -59,6 +59,14 @@ func TestEditorRuntimeSmoke(t *testing.T) {
 	}()
 	w.present()
 	waitForUI(t, func() bool { return w.win.Width() > 0 && w.win.Height() > 0 })
+	w.content.SetStateFlags(gtk.StateFlagBackdrop, false)
+	if w.content.StateFlags()&gtk.StateFlagBackdrop == 0 {
+		t.Fatal("runtime could not establish the backdrop-state test precondition")
+	}
+	preserveWindowContrast(&w.win.Widget)
+	if w.content.StateFlags()&gtk.StateFlagBackdrop != 0 {
+		t.Fatal("inactive-window contrast preservation left content in backdrop state")
+	}
 
 	doc := w.newDocument(nil)
 	if w.tabs.NPages() != 1 || w.active() != doc {
@@ -229,10 +237,20 @@ func TestEditorRuntimeSmoke(t *testing.T) {
 		t.Fatal("mid-line completion was not shown in reserved space")
 	}
 
+	redraws := 0
+	redraw := doc.ghost.redraw
+	doc.ghost.redraw = func() {
+		redraws++
+		redraw()
+	}
 	doc.buffer.PlaceCursor(doc.buffer.EndIter())
 	doc.showCompletion(" ghost\nnext", doc.buffer.CharCount())
+	doc.ghost.redraw = redraw
 	if got := bufferText(doc.buffer); got != "left right" {
 		t.Fatalf("line-end completion changed document buffer to %q", got)
+	}
+	if redraws == 0 {
+		t.Fatal("moving a completion did not invalidate its previous pixels")
 	}
 	if !doc.ghost.area.Visible() || doc.ghost.spaceStart == nil || doc.ghostText != " ghost\nnext" {
 		t.Fatalf("safe completion was not rendered exactly: text=%q visible=%v", doc.ghostText, doc.ghost.area.Visible())
@@ -262,12 +280,15 @@ func TestEditorRuntimeSmoke(t *testing.T) {
 
 	setBufferText(doc, "prefix ")
 	doc.buffer.PlaceCursor(doc.buffer.EndIter())
-	doc.requestCompletion(true)
+	if !w.keyPressed(gdk.KEY_backslash, 0, gdk.AltMask) {
+		t.Fatal("Alt+backslash did not trigger manual completion")
+	}
 	waitForUI(t, func() bool { return w.activity.serving.Text() == "runtime" })
 	if doc.ghostText != "completion" || !doc.ghost.area.Visible() {
 		t.Fatalf("generated completion was not visible: text=%q visible=%v", doc.ghostText, doc.ghost.area.Visible())
 	}
-	if len(w.activity.history) == 0 || w.activity.model.Text() != "AI: runtime" {
+	if len(w.activity.history) == 0 || w.activity.model.Text() != "AI: runtime" ||
+		w.activity.label.Text() != "Suggestion ready" {
 		t.Fatal("AI completion was not reported by the persistent status bar")
 	}
 	if handled := doc.keyPressed(gdk.KEY_Tab, 0, 0); !handled {

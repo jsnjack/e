@@ -89,6 +89,14 @@ func (s *providerState) available() bool {
 func (s *providerState) result(err error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if err != nil && errors.Is(err, context.DeadlineExceeded) {
+		// Slow inference is not evidence that the endpoint is unavailable. Keep
+		// it eligible so a later request can succeed after a cold model loads.
+		s.checked = false
+		s.healthy = false
+		s.failedAt = time.Time{}
+		return
+	}
 	s.checked = true
 	s.healthy = err == nil
 	if err == nil {

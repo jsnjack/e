@@ -18,6 +18,11 @@ import (
 	"github.com/jsnjack/e/internal/config"
 )
 
+const (
+	remoteCompletionTimeout = 8 * time.Second
+	localCompletionTimeout  = 30 * time.Second
+)
+
 // KeyFunc supplies the API key for an endpoint.
 type KeyFunc func(provider, endpoint string) string
 
@@ -54,11 +59,18 @@ func NewProviders(models []config.Model, keyFor KeyFunc) ([]Provider, error) {
 		transport := http.DefaultTransport.(*http.Transport).Clone()
 		transport.DialContext = (&net.Dialer{Timeout: 700 * time.Millisecond, KeepAlive: 30 * time.Second}).DialContext
 		providers = append(providers, &openAIProvider{
-			client: &http.Client{Timeout: 4 * time.Second, Transport: transport},
+			client: &http.Client{Timeout: completionTimeout(model.Endpoint), Transport: transport},
 			model:  model, keyFor: keyFor,
 		})
 	}
 	return providers, nil
+}
+
+func completionTimeout(endpoint string) time.Duration {
+	if endpointIsLoopback(endpoint) {
+		return localCompletionTimeout
+	}
+	return remoteCompletionTimeout
 }
 
 func (p *openAIProvider) Label() string { return p.model.Name }

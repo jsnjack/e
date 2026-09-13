@@ -54,13 +54,3 @@ func TestStatusLanguage(t *testing.T) {
 		}
 	}
 }
-
-func TestRoutineCompletion(t *testing.T) {
-	if !routineCompletion(activity.Event{Kind: activity.AI, Label: "Generating suggestion"}) {
-		t.Fatal("automatic completion was not classified as routine status")
-	}
-	if routineCompletion(activity.Event{Kind: activity.AI, Label: "Transforming selection"}) ||
-		routineCompletion(activity.Event{Kind: activity.File, Label: "Generating suggestion"}) {
-		t.Fatal("meaningful operation was classified as routine completion")
-	}
-}

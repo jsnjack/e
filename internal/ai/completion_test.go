@@ -3,6 +3,7 @@ package ai
 import (
 	"context"
 	"errors"
+	"fmt"
 	"testing"
 )
 
@@ -68,6 +69,14 @@ func TestAvailabilityProbeDoesNotTemporarilyDisableProvider(t *testing.T) {
 	close(provider.release)
 	if err != nil || text != "ready" {
 		t.Fatalf("completion during probe = %q, %v", text, err)
+	}
+}
+
+func TestGenerationTimeoutDoesNotQuarantineProvider(t *testing.T) {
+	state := &providerState{checked: true, healthy: true}
+	state.result(fmt.Errorf("request: %w", context.DeadlineExceeded))
+	if !state.available() {
+		t.Fatal("a slow generation quarantined an otherwise available provider")
 	}
 }
 

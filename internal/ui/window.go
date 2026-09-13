@@ -86,9 +86,11 @@ func (w *window) build() {
 	w.win.SetTitle("E")
 	w.win.SetDefaultSize(1100, 760)
 	w.win.Connect("notify::is-active", func() {
-		logging.Trace("ui: window focus changed", "active", w.win.IsActive(), "preferences", w.preferences != nil)
+		logging.Trace("ui: window focus changed", "active", w.win.IsActive(), "sensitive", w.win.IsSensitive(),
+			"preferences", w.preferences != nil)
 		if !w.win.IsActive() {
 			w.clearPendingChord()
+			preserveWindowContrast(&w.win.Widget)
 		}
 	})
 	logging.Trace("ui: application window ready")
@@ -274,6 +276,7 @@ func (w *window) registerActions() {
 		}
 	}, "<Control>w")
 	w.action("complete", func() {
+		logging.Trace("ui: completion action activated")
 		if doc := w.active(); doc != nil {
 			doc.requestCompletion(true)
 		}
@@ -329,6 +332,13 @@ func (w *window) keyPressed(keyval, _ uint, state gdk.ModifierType) bool {
 	shift := state&gdk.ShiftMask != 0
 	alt := state&gdk.AltMask != 0
 	super := state&gdk.SuperMask != 0
+	if alt && !ctrl && !super && lower == gdk.KEY_backslash {
+		logging.Trace("ui: completion shortcut pressed", "keyval", keyval, "shift", shift)
+		if doc := w.active(); doc != nil {
+			doc.requestCompletion(true)
+		}
+		return true
+	}
 	if w.pendingCtrlK {
 		w.clearPendingChord()
 		if ctrl && !shift && !alt && !super && lower == gdk.KEY_s {
@@ -353,6 +363,20 @@ func (w *window) clearPendingChord() {
 	if w.ctrlKTimer != 0 {
 		glib.SourceRemove(w.ctrlKTimer)
 		w.ctrlKTimer = 0
+	}
+}
+
+// preserveWindowContrast removes GTK's inherited backdrop state. Source-view
+// syntax tags are otherwise attenuated when focus briefly moves to a portal or
+// screenshot tool, making a document look disabled even though it remains
+// interactive.
+func preserveWindowContrast(widget *gtk.Widget) {
+	if widget == nil {
+		return
+	}
+	widget.UnsetStateFlags(gtk.StateFlagBackdrop)
+	for child := widget.FirstChild(); child != nil; child = gtk.BaseWidget(child).NextSibling() {
+		preserveWindowContrast(gtk.BaseWidget(child))
 	}
 }
 
@@ -414,7 +438,7 @@ func (w *window) setCompleter(completer *ai.Completer) {
 		w.aiCancel = nil
 	}
 	w.completer = completer
-	if completer != nil {
+	if completer != nil && w.options.Config.AI.Enabled && w.options.Config.AI.Consented {
 		ctx, cancel := context.WithCancel(w.ctx)
 		w.aiCancel = cancel
 		logging.Trace("ui: start autocomplete probes")
@@ -696,9 +720,15 @@ func loadCSS() {
 }
 .status-bar button { min-width: 24px; min-height: 22px; padding: 0 4px; }
 .status-position, .status-model { padding: 0 4px; }
+.e-window:backdrop,
+.e-window:backdrop > contents,
+.e-window:backdrop toastoverlay,
+.e-window:backdrop toolbarview,
+.e-window:backdrop toolbarview > .content,
 .e-window:backdrop .editor-content,
 .e-window:backdrop .editor,
 .e-window:backdrop .project-tree,
+.e-window:backdrop .status-bar,
 .e-window:backdrop headerbar,
 .e-window:backdrop headerbar windowhandle,
 .e-window:backdrop tabbar,
@@ -706,6 +736,7 @@ func loadCSS() {
 .e-window:backdrop tabbar .box > scrolledwindow {
   filter: none;
   opacity: 1;
+	transition: none;
 }
 .e-window:backdrop .editor-content,
 .e-window:backdrop .project-tree { color: @window_fg_color; }

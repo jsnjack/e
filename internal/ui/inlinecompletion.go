@@ -11,7 +11,7 @@ import (
 )
 
 const (
-	ghostAlpha               = 0.48
+	ghostAlpha               = 0.68
 	maxInlineCompletionRunes = 2048
 )
 
@@ -24,6 +24,7 @@ type inlineCompletionRenderer struct {
 	buffer *gtk.TextBuffer
 	area   *gtk.DrawingArea
 	space  *gtk.TextTag
+	redraw func()
 
 	composed      string
 	prefixBytes   int
@@ -52,6 +53,7 @@ func newInlineCompletionRenderer(view *gtk.TextView, buffer *gtk.TextBuffer) *in
 	renderer.area.SetVisible(false)
 	renderer.area.SetDrawFunc(renderer.draw)
 	view.AddOverlay(renderer.area, 0, 0)
+	renderer.redraw = view.QueueDraw
 	return renderer
 }
 
@@ -132,6 +134,7 @@ func (r *inlineCompletionRenderer) reserveSpace(cursor, lineEnd *gtk.TextIter, p
 }
 
 func (r *inlineCompletionRenderer) hide() {
+	wasVisible := r.area != nil && r.area.Visible()
 	if r.area != nil {
 		r.area.SetVisible(false)
 	}
@@ -151,6 +154,11 @@ func (r *inlineCompletionRenderer) hide() {
 	r.prefixBytes = 0
 	r.suggestionEnd = 0
 	r.preview = false
+	if wasVisible && r.redraw != nil {
+		// GtkTextView does not reliably invalidate the old pixels when a text
+		// overlay is hidden and moved again in the same frame.
+		r.redraw()
+	}
 }
 
 func (r *inlineCompletionRenderer) close() {

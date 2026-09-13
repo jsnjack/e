@@ -654,15 +654,29 @@ func (d *editorDocument) scheduleCompletion() {
 }
 
 func (d *editorDocument) requestCompletion(manual bool) {
-	if d.window.completer == nil || d.closed || d.loading {
+	logging.Trace("ui: completion requested", "manual", manual, "configured", d.window.completer != nil,
+		"automatic", d.window.options.Config.AI.Enabled, "consented", d.window.options.Config.AI.Consented)
+	operation := d.window.activityHub.Begin(activity.AI, "Generating suggestion")
+	if d.window.completer == nil {
+		operation.Fail(fmt.Errorf("no AI autocomplete models are configured"))
+		return
+	}
+	if d.closed {
+		operation.Cancel()
+		return
+	}
+	if d.loading {
+		operation.Fail(fmt.Errorf("document is still loading"))
 		return
 	}
 	if _, _, selected := d.buffer.SelectionBounds(); selected {
+		operation.Fail(fmt.Errorf("move the caret to request a suggestion"))
 		return
 	}
 	cursor := d.buffer.IterAtMark(d.buffer.GetInsert())
 	offset := cursor.Offset()
 	if !manual && offset == 0 {
+		operation.Cancel()
 		return
 	}
 	maxPrefix := d.window.options.Config.AI.PrefixSize
@@ -674,6 +688,7 @@ func (d *editorDocument) requestCompletion(manual bool) {
 		Filename: filepath.Base(d.path), Language: languageForPath(d.path),
 	}
 	if strings.TrimSpace(req.Prefix) == "" && !manual {
+		operation.Cancel()
 		return
 	}
 	if d.completionCancel != nil {
@@ -684,16 +699,18 @@ func (d *editorDocument) requestCompletion(manual bool) {
 	ctx, cancel := context.WithCancel(d.window.ctx)
 	d.completionCancel = cancel
 	completer := d.window.completer
-	operation := d.window.activityHub.Begin(activity.AI, "Generating suggestion")
+	requestedAt := time.Now()
 	go func() {
 		completion, err := completer.CompleteDetailed(ctx, req)
 		if err != nil {
 			operation.Fail(err)
 			if !errors.Is(err, context.Canceled) {
-				slog.Debug("AI completion", "err", err)
+				slog.Debug("AI completion", "duration", time.Since(requestedAt), "err", err)
 			}
 			return
 		}
+		logging.Trace("ui: completion returned", "model", completion.Model, "characters", utf8.RuneCountInString(completion.Text),
+			"cached", completion.Cached, "fallback", completion.Fallback, "duration", time.Since(requestedAt))
 		dispatch.Main(func() {
 			if d.closed || gen != d.completionGen || d.buffer.IterAtMark(d.buffer.GetInsert()).Offset() != offset {
 				operation.Cancel()

@@ -144,3 +144,12 @@ func TestValidateEndpoint(t *testing.T) {
 		})
 	}
 }
+
+func TestCompletionTimeoutAllowsLocalColdStart(t *testing.T) {
+	if got := completionTimeout("http://localhost:13305/v1"); got != localCompletionTimeout {
+		t.Fatalf("local timeout = %v, want %v", got, localCompletionTimeout)
+	}
+	if got := completionTimeout("https://example.com/v1"); got != remoteCompletionTimeout {
+		t.Fatalf("remote timeout = %v, want %v", got, remoteCompletionTimeout)
+	}
+}
