@@ -10,7 +10,7 @@ while adding inline AI and language-server completion.
 - Search and replace with highlighted matches.
 - Chunked loading and background disk access for multi-megabyte files.
 - Atomic saves, line-ending preservation, session recovery, and EditorConfig.
-- Automatic inline AI completion with cancellation and an ordered fallback chain.
+- Opt-in inline AI completion with cancellation and an ordered fallback chain.
 - Review-before-apply AI transformations for selected text.
 - Offline completion through a local OpenAI-compatible endpoint such as
   Lemonade serving Gemma.
@@ -20,11 +20,15 @@ while adding inline AI and language-server completion.
 - Fuzzy Command Palette and asynchronous project Quick Open.
 - Live, side-by-side GitHub-flavored Markdown preview through WebKitGTK 6.
 
-The default autocomplete order is `local-qwen` at a remote endpoint followed
-by `Gemma-4-E4B-it-GGUF` at Lemonade on `localhost:13305`. On first launch, E
-imports the ordered AI chain from Mailbox when available. Credentials are read
-from the system keyring, first under `e-ai` and then under `mailbox-ai`; they are
-never stored in the configuration file.
+Automatic AI suggestions are disabled by default and require an explicit,
+persisted consent in Preferences. When enabled, the default
+autocomplete order is `local-qwen` at a remote endpoint followed by
+`Gemma-4-E4B-it-GGUF` at Lemonade on `localhost:13305`. On first launch, E imports
+the ordered AI chain from Mailbox when available. Requests contain bounded text
+around the caret and the file's base name, never its full path. Credentials are
+read from the system keyring, first under `e-ai` and then under `mailbox-ai`; they
+are never stored in the configuration file and can be explicitly forgotten in
+Preferences.
 
 ## Build
 
@@ -48,7 +52,7 @@ sudo make install
 
 Configuration is stored at `$XDG_CONFIG_HOME/e/config.toml`, or
 `~/.config/e/config.toml`. Models appear as an ordered `[[ai.chain]]` list. Every
-entry is enabled for automatic completion and is tried according to availability.
+entry is tried according to availability after automatic suggestions are enabled.
 Plain HTTP endpoints require `allow_insecure_http = true`; loopback endpoints are
 accepted automatically.
 

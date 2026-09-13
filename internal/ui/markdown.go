@@ -48,6 +48,7 @@ func (d *editorDocument) scheduleMarkdownPreview() {
 	if d.previewTimer != nil {
 		d.previewTimer.Stop()
 	}
+	d.previewGen++
 	d.previewTimer = time.AfterFunc(markdownPreviewDebounce, func() {
 		dispatch.Main(func() {
 			if d.previewVisible && !d.closed {
@@ -58,21 +59,32 @@ func (d *editorDocument) scheduleMarkdownPreview() {
 }
 
 func (d *editorDocument) renderMarkdownPreview() {
-	start, end := d.buffer.Bounds()
-	source := []byte(d.buffer.Text(start, end, true))
+	if d.previewBusy {
+		d.previewPending = true
+		return
+	}
 	d.previewGen++
 	generation := d.previewGen
 	title := d.title()
 	baseURI := markdownBaseURI(d.path)
-	go func() {
-		document, err := markdownpreview.Render(source, title)
-		dispatch.Main(func() {
-			if err != nil || d.closed || !d.previewVisible || generation != d.previewGen {
-				return
-			}
-			d.preview.Load(document, baseURI)
-		})
-	}()
+	d.textSnapshotAsync(func() bool {
+		return !d.closed && d.previewVisible && generation == d.previewGen
+	}, func(source string) {
+		d.previewBusy = true
+		go func() {
+			document, err := markdownpreview.Render([]byte(source), title)
+			dispatch.Main(func() {
+				d.previewBusy = false
+				if err == nil && !d.closed && d.previewVisible && generation == d.previewGen {
+					d.preview.Load(document, baseURI)
+				}
+				if d.previewPending && !d.closed && d.previewVisible {
+					d.previewPending = false
+					d.renderMarkdownPreview()
+				}
+			})
+		}()
+	})
 }
 
 func isMarkdownPath(path string) bool {

@@ -137,13 +137,23 @@ func (d *editorDocument) connectPointerSelection() {
 				break
 			}
 		}
-		if !removed && len(d.multiCursors) < maxMultipleCursors {
+		if !removed && !d.cursorIntersects(offset) && len(d.multiCursors) < maxMultipleCursors {
 			d.multiCursors = append(d.multiCursors, multiCursor{anchor: offset, head: offset})
 		}
 		d.renderMultipleSelections()
 		click.SetState(gtk.EventSequenceClaimed)
 	})
 	d.view.Widget.AddController(click)
+}
+
+func (d *editorDocument) cursorIntersects(offset int) bool {
+	for _, cursor := range d.multiCursors {
+		start, end := cursor.bounds()
+		if offset == start || (offset > start && offset < end) {
+			return true
+		}
+	}
+	return false
 }
 
 func (d *editorDocument) addCursorVertically(direction int) {

@@ -28,6 +28,7 @@ type Model struct {
 // AI configures automatic inline completion.
 type AI struct {
 	Enabled    bool    `toml:"enabled"`
+	Consented  bool    `toml:"consented"`
 	DebounceMS int     `toml:"debounce_ms"`
 	PrefixSize int     `toml:"prefix_bytes"`
 	SuffixSize int     `toml:"suffix_bytes"`
@@ -61,7 +62,7 @@ type Config struct {
 func Default() Config {
 	return Config{
 		AI: AI{
-			Enabled: true, DebounceMS: defaultDebounceMS,
+			Enabled: false, DebounceMS: defaultDebounceMS,
 			PrefixSize: defaultPrefixSize, SuffixSize: defaultSuffixSize,
 			Chain: []Model{
 				{Name: "local-qwen", Provider: "openai", Endpoint: "https://models.example.com/v1", Protocol: "chat"},

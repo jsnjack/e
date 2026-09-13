@@ -22,7 +22,7 @@ type Options struct {
 	Config           config.Config
 	Paths            config.Paths
 	Completer        *ai.Completer
-	RebuildCompleter func(config.Config, map[string]string) (*ai.Completer, error)
+	RebuildCompleter func(config.Config, map[string]string, []string) (*ai.Completer, error)
 	TestModel        func(context.Context, config.Model, string) error
 }
 

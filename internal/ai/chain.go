@@ -57,10 +57,6 @@ func (c *Chain) Start(ctx context.Context) {
 func (c *Chain) probe(ctx context.Context) {
 	for _, state := range c.providers {
 		state := state
-		state.mu.Lock()
-		state.checked = true
-		state.healthy = false
-		state.mu.Unlock()
 		go func() {
 			probeCtx, cancel := context.WithTimeout(ctx, 1500*time.Millisecond)
 			defer cancel()
@@ -70,6 +66,8 @@ func (c *Chain) probe(ctx context.Context) {
 			state.healthy = err == nil
 			if err == nil {
 				state.failedAt = time.Time{}
+			} else {
+				state.failedAt = time.Now()
 			}
 			state.mu.Unlock()
 		}()

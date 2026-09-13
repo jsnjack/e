@@ -35,6 +35,11 @@ func (w *window) commandPaletteItems() []paletteItem {
 		{id: "open", title: "File: Open File…", shortcut: "Ctrl+O", run: w.chooseOpen},
 		{id: "save", title: "File: Save", shortcut: "Ctrl+S", run: w.saveActive},
 		{id: "save-as", title: "File: Save As…", shortcut: "Ctrl+Shift+S", run: w.saveActiveAs},
+		{id: "close", title: "File: Close Tab", shortcut: "Ctrl+W", run: func() {
+			if page := w.tabs.SelectedPage(); page != nil {
+				w.tabs.ClosePage(page)
+			}
+		}},
 		{id: "quick-open", title: "Go: Quick Open", shortcut: "Ctrl+P", run: w.showQuickOpen},
 		{id: "sidebar", title: "View: Toggle Primary Side Bar", shortcut: "Ctrl+B", run: w.toggleSidebar},
 		{id: "markdown-preview", title: "View: Open Markdown Preview", shortcut: "Ctrl+Shift+V", run: func() {
@@ -44,12 +49,39 @@ func (w *window) commandPaletteItems() []paletteItem {
 		}},
 		{id: "find", title: "Edit: Find", shortcut: "Ctrl+F", run: func() { w.showSearch(false) }},
 		{id: "replace", title: "Edit: Replace", shortcut: "Ctrl+H", run: func() { w.showSearch(true) }},
+		{id: "undo", title: "Edit: Undo", shortcut: "Ctrl+Z", run: func() {
+			if doc := w.active(); doc != nil && doc.buffer.CanUndo() {
+				doc.buffer.Undo()
+			}
+		}},
+		{id: "redo", title: "Edit: Redo", shortcut: "Ctrl+Shift+Z", run: func() {
+			if doc := w.active(); doc != nil && doc.buffer.CanRedo() {
+				doc.buffer.Redo()
+			}
+		}},
+		{id: "select-next", title: "Selection: Add Next Occurrence", shortcut: "Ctrl+D", run: func() {
+			if doc := w.active(); doc != nil {
+				doc.selectNextOccurrence()
+			}
+		}},
+		{id: "select-all", title: "Selection: Select All Occurrences", shortcut: "Ctrl+Shift+L", run: func() {
+			if doc := w.active(); doc != nil {
+				doc.selectAllOccurrences()
+			}
+		}},
+		{id: "next-tab", title: "View: Next Tab", shortcut: "Ctrl+Tab", run: func() { w.selectRelativeTab(1) }},
+		{id: "previous-tab", title: "View: Previous Tab", shortcut: "Ctrl+Shift+Tab", run: func() { w.selectRelativeTab(-1) }},
 		{id: "ai-complete", title: "AI: Trigger Inline Suggestion", shortcut: "Alt+\\", run: func() {
 			if doc := w.active(); doc != nil {
 				doc.requestCompletion(true)
 			}
 		}},
 		{id: "ai-transform", title: "AI: Transform Selection…", run: w.showAITransform},
+		{id: "lsp-complete", title: "Code: Trigger Language Completion", shortcut: "Ctrl+Space", run: func() {
+			if doc := w.active(); doc != nil {
+				doc.requestLSPCompletion()
+			}
+		}},
 		{id: "preferences", title: "Preferences: Open Settings", shortcut: "Ctrl+,", run: w.openPreferences},
 	}
 }
@@ -243,26 +275,31 @@ func paletteRow(item paletteItem) *gtk.ListBoxRow {
 
 // fuzzyScore rewards ordered, consecutive, and word-boundary matches.
 func fuzzyScore(query, candidate string) int {
-	query = strings.ToLower(query)
-	candidate = strings.ToLower(candidate)
-	if query == "" {
+	queryRunes := []rune(strings.ToLower(query))
+	candidateRunes := []rune(strings.ToLower(candidate))
+	if len(queryRunes) == 0 {
 		return 0
 	}
 	score, previous, searchFrom := 0, -2, 0
-	for _, wanted := range query {
-		position := strings.IndexRune(candidate[searchFrom:], wanted)
-		if position < 0 {
+	for _, wanted := range queryRunes {
+		position := -1
+		for index := searchFrom; index < len(candidateRunes); index++ {
+			if candidateRunes[index] == wanted {
+				position = index
+				break
+			}
+		}
+		if position == -1 {
 			return -1
 		}
-		position += searchFrom
 		score += 5
 		if position == previous+1 {
 			score += 8
 		}
-		if position == 0 || strings.ContainsRune(" /_-:.", rune(candidate[position-1])) {
+		if position == 0 || strings.ContainsRune(" /_-:.", candidateRunes[position-1]) {
 			score += 6
 		}
 		previous, searchFrom = position, position+1
 	}
-	return score - len(candidate)/8
+	return score - len(candidateRunes)/8
 }

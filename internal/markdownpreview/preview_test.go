@@ -10,7 +10,7 @@ import (
 )
 
 func TestRenderMarkdownSafely(t *testing.T) {
-	document, err := Render([]byte("# Hello\n\n- one\n- two\n\n<script>alert(1)</script>"), "A & B")
+	document, err := Render([]byte("# Hello\n\n- one\n- two\n\n[remote](https://example.com)\n\n<script>alert(1)</script>"), "A & B")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -21,6 +21,9 @@ func TestRenderMarkdownSafely(t *testing.T) {
 	}
 	if strings.Contains(document, "<script>") {
 		t.Fatal("raw script was rendered")
+	}
+	if strings.Contains(document, `href="https://example.com"`) {
+		t.Fatal("preview retained a navigable remote link")
 	}
 }
 

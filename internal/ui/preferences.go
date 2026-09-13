@@ -10,22 +10,26 @@ import (
 	"github.com/diamondburned/gotk4-adwaita/pkg/adw"
 	"github.com/diamondburned/gotk4/pkg/gtk/v4"
 	"github.com/jsnjack/e/internal/activity"
+	"github.com/jsnjack/e/internal/ai"
 	"github.com/jsnjack/e/internal/config"
 	"github.com/jsnjack/e/internal/dispatch"
 )
 
 type modelPreference struct {
-	row      *adw.ExpanderRow
-	name     *adw.EntryRow
-	endpoint *adw.EntryRow
-	key      *adw.PasswordEntryRow
-	http     *adw.SwitchRow
-	up       *gtk.Button
-	protocol string
+	row               *adw.ExpanderRow
+	name              *adw.EntryRow
+	endpoint          *adw.EntryRow
+	key               *adw.PasswordEntryRow
+	http              *adw.SwitchRow
+	up                *gtk.Button
+	protocol          string
+	forgetKey         bool
+	forgottenEndpoint string
 }
 
 func (w *window) buildPreferences() *adw.PreferencesDialog {
 	dialog := adw.NewPreferencesDialog()
+	preferencesContext, cancelPreferences := context.WithCancel(w.ctx)
 	dialog.SetTitle("E Preferences")
 	dialog.SetContentWidth(680)
 	dialog.SetContentHeight(680)
@@ -52,10 +56,15 @@ func (w *window) buildPreferences() *adw.PreferencesDialog {
 	aiGroup := adw.NewPreferencesGroup()
 	aiGroup.SetTitle("AI Autocomplete")
 	aiGroup.SetDescription("Models are tried in this order. If one is offline, E automatically uses the next available model.")
-	aiEnabled := preferenceSwitch("Automatic suggestions", "Use this model chain for inline completions while typing.", w.options.Config.AI.Enabled)
+	aiEnabled := preferenceSwitch(
+		"Automatic suggestions",
+		"Send bounded source context and the base filename to configured model endpoints.",
+		w.options.Config.AI.Enabled && w.options.Config.AI.Consented,
+	)
 	aiGroup.Add(aiEnabled)
 
 	var rows []*modelPreference
+	var allRows []*modelPreference
 	var inGroup []*adw.ExpanderRow
 	relayout := func() {
 		for _, row := range inGroup {
@@ -87,6 +96,24 @@ func (w *window) buildPreferences() *adw.PreferencesDialog {
 		item.endpoint.SetText(model.Endpoint)
 		item.key = adw.NewPasswordEntryRow()
 		item.key.SetTitle("API key (stored in the system keyring)")
+		forgetKey := gtk.NewButtonFromIconName("edit-clear-symbolic")
+		forgetKey.AddCSSClass("flat")
+		forgetKey.SetTooltipText("Forget the stored API key")
+		forgetKey.SetVAlign(gtk.AlignCenter)
+		forgetKey.ConnectClicked(func() {
+			item.key.SetText("")
+			item.forgetKey = true
+			item.forgottenEndpoint = strings.TrimSpace(item.endpoint.Text())
+			forgetKey.SetTooltipText("The stored key will be forgotten when preferences close")
+		})
+		item.key.AddSuffix(forgetKey)
+		item.key.Connect("changed", func() {
+			if item.key.Text() != "" {
+				item.forgetKey = false
+				item.forgottenEndpoint = ""
+				forgetKey.SetTooltipText("Forget the stored API key")
+			}
+		})
 		item.http = preferenceSwitch("Allow insecure HTTP", "Only for a trusted local endpoint.", model.AllowInsecureHTTP)
 		item.row.AddRow(item.name)
 		item.row.AddRow(item.endpoint)
@@ -112,10 +139,14 @@ func (w *window) buildPreferences() *adw.PreferencesDialog {
 				test.RemoveCSSClass("success")
 				test.RemoveCSSClass("error")
 				go func() {
-					ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+					ctx, cancel := context.WithTimeout(preferencesContext, 10*time.Second)
 					defer cancel()
 					err := w.options.TestModel(ctx, entry, key)
 					dispatch.Main(func() {
+						if preferencesContext.Err() != nil {
+							operation.Cancel()
+							return
+						}
 						test.SetSensitive(true)
 						if err != nil {
 							operation.Fail(err)
@@ -163,6 +194,7 @@ func (w *window) buildPreferences() *adw.PreferencesDialog {
 		item.row.AddSuffix(item.up)
 		item.row.AddSuffix(remove)
 		rows = append(rows, item)
+		allRows = append(allRows, item)
 		updateTitle(item)
 		relayout()
 		item.row.SetExpanded(expand)
@@ -188,6 +220,7 @@ func (w *window) buildPreferences() *adw.PreferencesDialog {
 	dialog.Add(page)
 
 	dialog.ConnectClosed(func() {
+		cancelPreferences()
 		cfg := w.options.Config
 		cfg.Editor.LineNumbers = lineNumbers.Active()
 		cfg.Editor.WordWrap = wordWrap.Active()
@@ -197,8 +230,15 @@ func (w *window) buildPreferences() *adw.PreferencesDialog {
 			cfg.Editor.TabWidth = width
 		}
 		cfg.AI.Enabled = aiEnabled.Active()
+		cfg.AI.Consented = aiEnabled.Active()
 		cfg.AI.Chain = nil
 		keys := make(map[string]string)
+		var forgotten []string
+		for _, item := range allRows {
+			if item.forgetKey && item.forgottenEndpoint != "" {
+				forgotten = append(forgotten, item.forgottenEndpoint)
+			}
+		}
 		for _, item := range rows {
 			model := modelFromPreference(item)
 			if model.Name == "" || model.Endpoint == "" {
@@ -214,30 +254,38 @@ func (w *window) buildPreferences() *adw.PreferencesDialog {
 		// could leave the modal shade visible on some compositors.
 		w.preferencesApplying = true
 		dispatch.Main(func() {
-			defer func() { w.preferencesApplying = false }()
-			if err := config.Save(w.options.ConfigPath, cfg); err != nil {
-				slog.Warn("save preferences", "err", err)
-				w.toast("Couldn’t save preferences")
-				return
-			}
-			w.options.Config = cfg
-			for _, doc := range w.documents {
-				doc.configureRuntimePreferences()
-			}
-			if w.options.RebuildCompleter == nil {
-				w.toast("Preferences saved")
+			if _, err := ai.NewProviders(cfg.AI.Chain, nil); err != nil {
+				w.preferencesApplying = false
+				slog.Warn("validate preferences", "err", err)
+				w.toast("Settings weren’t saved: " + err.Error())
 				return
 			}
 			go func() {
-				completer, err := w.options.RebuildCompleter(cfg, keys)
+				var completer *ai.Completer
+				var err error
+				if w.options.RebuildCompleter != nil {
+					completer, err = w.options.RebuildCompleter(cfg, keys, forgotten)
+				}
+				if err == nil {
+					err = config.Save(w.options.ConfigPath, cfg)
+				}
 				dispatch.Main(func() {
+					w.preferencesApplying = false
 					if err != nil {
-						slog.Warn("apply AI preferences", "err", err)
-						w.toast("Saved, but couldn’t apply AI settings")
+						slog.Warn("save preferences", "err", err)
+						w.toast("Settings weren’t saved: " + err.Error())
 						return
 					}
-					w.setCompleter(completer)
-					w.toast("Preferences saved and applied")
+					w.options.Config = cfg
+					for _, doc := range w.documents {
+						doc.configureRuntimePreferences()
+					}
+					if w.options.RebuildCompleter != nil {
+						w.setCompleter(completer)
+						w.toast("Preferences saved and applied")
+						return
+					}
+					w.toast("Preferences saved")
 				})
 			}()
 		})

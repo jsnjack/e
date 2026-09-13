@@ -77,12 +77,17 @@ type Client struct {
 
 	cmd         *exec.Cmd
 	stdin       io.WriteCloser
-	mu          sync.Mutex
+	outgoing    chan outbound
 	nextID      atomic.Int64
 	pendMu      sync.Mutex
 	pending     map[int64]chan response
 	diagnostics func(string, []Diagnostic)
 	done        chan struct{}
+}
+
+type outbound struct {
+	message any
+	result  chan error
 }
 
 // New constructs a client. Start must be called before document operations.
@@ -113,6 +118,8 @@ func (c *Client) Start(ctx context.Context) error {
 	if err := c.cmd.Start(); err != nil {
 		return fmt.Errorf("start language server %s: %w", c.command, err)
 	}
+	c.outgoing = make(chan outbound, 256)
+	go c.writeLoop()
 	go c.readLoop(stdout)
 	go c.logStderr(stderr)
 	var initialized json.RawMessage
@@ -228,7 +235,7 @@ func (c *Client) call(ctx context.Context, method string, params any, out any) e
 		delete(c.pending, id)
 		c.pendMu.Unlock()
 	}()
-	if err := c.write(map[string]any{"jsonrpc": "2.0", "id": id, "method": method, "params": params}); err != nil {
+	if err := c.write(ctx, map[string]any{"jsonrpc": "2.0", "id": id, "method": method, "params": params}); err != nil {
 		return err
 	}
 	select {
@@ -254,16 +261,68 @@ func (c *Client) call(ctx context.Context, method string, params any, out any) e
 }
 
 func (c *Client) notify(method string, params any) error {
-	return c.write(map[string]any{"jsonrpc": "2.0", "method": method, "params": params})
+	if c.outgoing == nil {
+		return fmt.Errorf("language server is not running")
+	}
+	select {
+	case <-c.done:
+		return fmt.Errorf("language server exited")
+	default:
+	}
+	request := outbound{message: map[string]any{"jsonrpc": "2.0", "method": method, "params": params}}
+	select {
+	case c.outgoing <- request:
+		return nil
+	case <-c.done:
+		return fmt.Errorf("language server exited")
+	default:
+		return fmt.Errorf("language-server write queue is full")
+	}
 }
 
-func (c *Client) write(message any) error {
+func (c *Client) write(ctx context.Context, message any) error {
+	if c.outgoing == nil {
+		return fmt.Errorf("language server is not running")
+	}
+	result := make(chan error, 1)
+	select {
+	case c.outgoing <- outbound{message: message, result: result}:
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-c.done:
+		return fmt.Errorf("language server exited")
+	}
+	select {
+	case err := <-result:
+		return err
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-c.done:
+		return fmt.Errorf("language server exited")
+	}
+}
+
+func (c *Client) writeLoop() {
+	for {
+		select {
+		case <-c.done:
+			return
+		case request := <-c.outgoing:
+			err := c.writeDirect(request.message)
+			if request.result != nil {
+				request.result <- err
+			} else if err != nil {
+				slog.Debug("write language-server notification", "command", c.command, "err", err)
+			}
+		}
+	}
+}
+
+func (c *Client) writeDirect(message any) error {
 	body, err := json.Marshal(message)
 	if err != nil {
 		return fmt.Errorf("encode language-server message: %w", err)
 	}
-	c.mu.Lock()
-	defer c.mu.Unlock()
 	if c.stdin == nil {
 		return fmt.Errorf("language server is not running")
 	}

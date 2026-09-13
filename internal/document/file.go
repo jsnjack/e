@@ -32,6 +32,9 @@ type File struct {
 	ModTime int64
 }
 
+// ErrChangedOnDisk indicates that a checked save would overwrite a newer disk version.
+var ErrChangedOnDisk = errors.New("file changed on disk")
+
 // Open reads a UTF-8 text file and normalizes line endings for the editor.
 func Open(path string) (File, error) {
 	abs, err := filepath.Abs(path)
@@ -60,6 +63,15 @@ func Open(path string) (File, error) {
 
 // Save durably replaces path while preserving the requested line ending.
 func Save(path string, text []byte, newline Newline, mode os.FileMode) (int64, error) {
+	return save(path, text, newline, mode, 0)
+}
+
+// SaveChecked saves only when path still has expectedModTime.
+func SaveChecked(path string, text []byte, newline Newline, mode os.FileMode, expectedModTime int64) (int64, error) {
+	return save(path, text, newline, mode, expectedModTime)
+}
+
+func save(path string, text []byte, newline Newline, mode os.FileMode, expectedModTime int64) (int64, error) {
 	if !utf8.Valid(text) {
 		return 0, fmt.Errorf("save %s: text is not valid UTF-8", path)
 	}
@@ -69,6 +81,22 @@ func Save(path string, text []byte, newline Newline, mode os.FileMode) (int64, e
 	}
 	if mode == 0 {
 		mode = 0o644
+	}
+	if expectedModTime != 0 {
+		changed, err := ChangedOnDisk(abs, expectedModTime)
+		if err != nil {
+			return 0, err
+		}
+		if changed {
+			return 0, ErrChangedOnDisk
+		}
+	}
+	if info, err := os.Lstat(abs); err == nil && info.Mode()&os.ModeSymlink != 0 {
+		resolved, resolveErr := filepath.EvalSymlinks(abs)
+		if resolveErr != nil {
+			return 0, fmt.Errorf("resolve save symlink: %w", resolveErr)
+		}
+		abs = resolved
 	}
 	data := encodeNewlines(text, newline)
 	if err := writeAtomic(abs, data, mode); err != nil {

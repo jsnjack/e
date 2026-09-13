@@ -8,8 +8,11 @@ import (
 
 func TestDefaultModelOrder(t *testing.T) {
 	cfg := Default()
-	if !cfg.AI.Enabled {
-		t.Fatal("automatic completion is disabled")
+	if cfg.AI.Enabled {
+		t.Fatal("automatic AI suggestions must require explicit opt-in")
+	}
+	if cfg.AI.Consented {
+		t.Fatal("AI data sharing must require explicit consent")
 	}
 	want := []string{"local-qwen", "Gemma-4-E4B-it-GGUF"}
 	if len(cfg.AI.Chain) != len(want) {

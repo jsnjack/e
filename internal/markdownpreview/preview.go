@@ -50,6 +50,7 @@ import (
 	"bytes"
 	"fmt"
 	"html"
+	"regexp"
 	"runtime"
 	"unsafe"
 
@@ -64,6 +65,8 @@ var renderer = goldmark.New(
 	goldmark.WithExtensions(extension.GFM),
 	goldmark.WithRendererOptions(gmhtml.WithHardWraps()),
 )
+
+var linkDestination = regexp.MustCompile(` href="([^"]*)"`)
 
 // View is a sandboxed Markdown presentation surface.
 type View struct{ Widget *gtk.Widget }
@@ -109,6 +112,7 @@ func Render(source []byte, title string) (string, error) {
 	if err := renderer.Convert(source, &body); err != nil {
 		return "", fmt.Errorf("render Markdown: %w", err)
 	}
+	safeBody := linkDestination.ReplaceAllString(body.String(), ` title="$1"`)
 	return `<!doctype html><html><head><meta charset="utf-8">
 <meta http-equiv="Content-Security-Policy" content="default-src 'none'; img-src file: data:; style-src 'unsafe-inline'">
 <meta name="color-scheme" content="light dark"><title>` + html.EscapeString(title) + `</title>
@@ -120,5 +124,5 @@ a { color: #1c71d8; } img { max-width: 100%; } blockquote { margin-left: 0; padd
 code,pre { font-family: ui-monospace, monospace; background: #f6f5f4; border-radius: 6px; } code { padding: .12em .3em; } pre { overflow: auto; padding: 14px; }
 table { border-collapse: collapse; } th,td { border: 1px solid #c0bfbc; padding: 6px 10px; } hr { border: 0; border-top: 1px solid #deddda; }
 @media (prefers-color-scheme: dark) { body { color: #f6f5f4; background: #242424; } h1 { border-color: #5e5c64; } a { color: #62a0ea; } code,pre { background: #303030; } th,td { border-color: #77767b; } blockquote { color: #c0bfbc; } }
-</style></head><body>` + body.String() + `</body></html>`, nil
+</style></head><body>` + safeBody + `</body></html>`, nil
 }

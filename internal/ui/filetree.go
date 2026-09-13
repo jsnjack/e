@@ -10,6 +10,7 @@ import (
 	"github.com/diamondburned/gotk4-adwaita/pkg/adw"
 	"github.com/diamondburned/gotk4/pkg/gtk/v4"
 	"github.com/jsnjack/e/internal/dispatch"
+	"github.com/jsnjack/e/internal/editorconfig"
 	"github.com/jsnjack/e/internal/logging"
 )
 
@@ -257,11 +258,9 @@ func (w *window) renameProjectEntry(path string) {
 				prefix := path + string(filepath.Separator)
 				for _, doc := range w.documents {
 					if doc.path == path {
-						doc.path = replacement
-						doc.updatePresentation()
+						doc.changePath(replacement)
 					} else if strings.HasPrefix(doc.path, prefix) {
-						doc.path = filepath.Join(replacement, strings.TrimPrefix(doc.path, prefix))
-						doc.updatePresentation()
+						doc.changePath(filepath.Join(replacement, strings.TrimPrefix(doc.path, prefix)))
 					}
 				}
 				w.setProjectRoot(w.projectRoot)
@@ -302,6 +301,17 @@ func (w *window) deleteProjectEntry(path string) {
 					w.toast("Couldn’t delete " + filepath.Base(path))
 					return
 				}
+				prefix := path + string(filepath.Separator)
+				for _, doc := range w.documents {
+					if doc.path == path || strings.HasPrefix(doc.path, prefix) {
+						doc.stopLSP()
+						doc.path = ""
+						doc.modTime = 0
+						doc.props = editorconfig.Properties{}
+						doc.buffer.SetModified(true)
+						doc.updatePresentation()
+					}
+				}
 				w.setProjectRoot(w.projectRoot)
 			})
 		}()
@@ -320,20 +330,25 @@ func (w *window) promptProjectName(title, initial, confirm string, done func(str
 	dialog.SetCloseResponse("cancel")
 	dialog.SetDefaultResponse("confirm")
 	dialog.SetResponseAppearance("confirm", adw.ResponseSuggested)
+	dialog.SetResponseEnabled("confirm", validProjectName(initial))
+	entry.Connect("changed", func() {
+		dialog.SetResponseEnabled("confirm", validProjectName(entry.Text()))
+	})
 	dialog.ConnectResponse(func(response string) {
 		if response != "confirm" {
 			return
 		}
 		name := strings.TrimSpace(entry.Text())
-		if name == "" || name == "." || name == ".." || strings.ContainsAny(name, `/\\`) {
-			w.toast("Enter a valid name without slashes")
-			return
-		}
 		done(name)
 	})
 	dialog.Present(w.win)
 	entry.GrabFocus()
 	entry.SelectRegion(0, -1)
+}
+
+func validProjectName(name string) bool {
+	name = strings.TrimSpace(name)
+	return name != "" && name != "." && name != ".." && !strings.ContainsAny(name, `/\\`)
 }
 
 func (w *window) safeProjectTarget(path string) bool {

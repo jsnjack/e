@@ -170,6 +170,7 @@ func splitProperty(line string) (string, string, bool) {
 
 func applyProperty(out *Properties, key, value string) {
 	if value == "unset" {
+		clearProperty(out, key)
 		return
 	}
 	parsePositive := func() int {
@@ -211,5 +212,26 @@ func applyProperty(out *Properties, key, value string) {
 		out.InsertFinalNewline = parseBool()
 	case "max_line_length":
 		out.MaxLineLength = parsePositive()
+	}
+}
+
+func clearProperty(out *Properties, key string) {
+	switch key {
+	case "indent_style":
+		out.IndentStyle = ""
+	case "indent_size":
+		out.IndentSize = 0
+	case "tab_width":
+		out.TabWidth = 0
+	case "end_of_line":
+		out.EndOfLine = ""
+	case "charset":
+		out.Charset = ""
+	case "trim_trailing_whitespace":
+		out.TrimTrailingWhitespace = nil
+	case "insert_final_newline":
+		out.InsertFinalNewline = nil
+	case "max_line_length":
+		out.MaxLineLength = 0
 	}
 }

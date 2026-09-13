@@ -6,7 +6,24 @@ import (
 	"encoding/json"
 	"strings"
 	"testing"
+	"time"
 )
+
+type blockingWriteCloser struct {
+	started chan struct{}
+	release chan struct{}
+}
+
+func (w *blockingWriteCloser) Write(body []byte) (int, error) {
+	select {
+	case w.started <- struct{}{}:
+	default:
+	}
+	<-w.release
+	return len(body), nil
+}
+
+func (*blockingWriteCloser) Close() error { return nil }
 
 func TestReadFrame(t *testing.T) {
 	tests := []struct {
@@ -72,6 +89,34 @@ func TestDecodeCompletions(t *testing.T) {
 	if _, err := decodeCompletions(json.RawMessage(`{"items":`)); err == nil {
 		t.Fatal("malformed completion response returned no error")
 	}
+}
+
+func TestNotificationDoesNotWaitForBlockedServerPipe(t *testing.T) {
+	writer := &blockingWriteCloser{started: make(chan struct{}, 1), release: make(chan struct{})}
+	client := &Client{
+		stdin: writer, outgoing: make(chan outbound, 2), done: make(chan struct{}),
+	}
+	go client.writeLoop()
+
+	returned := make(chan error, 1)
+	go func() {
+		returned <- client.Change("file:///test.go", 2, []Change{{Text: "x"}})
+	}()
+	select {
+	case err := <-returned:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(100 * time.Millisecond):
+		t.Fatal("notification blocked on the language-server pipe")
+	}
+	select {
+	case <-writer.started:
+	case <-time.After(time.Second):
+		t.Fatal("writer did not receive the queued notification")
+	}
+	close(writer.release)
+	close(client.done)
 }
 
 func TestFileURI(t *testing.T) {

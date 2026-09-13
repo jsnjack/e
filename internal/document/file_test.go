@@ -2,6 +2,7 @@ package document
 
 import (
 	"bytes"
+	"errors"
 	"os"
 	"path/filepath"
 	"testing"
@@ -104,6 +105,57 @@ func TestChangedOnDisk(t *testing.T) {
 	changed, err = ChangedOnDisk(path, file.ModTime)
 	if err != nil || !changed {
 		t.Fatalf("removed file = %v, %v", changed, err)
+	}
+}
+
+func TestSaveCheckedRejectsExternalChange(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "note.txt")
+	if err := os.WriteFile(path, []byte("original"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	opened, err := Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, []byte("external"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	changedAt := time.Unix(0, opened.ModTime).Add(time.Second)
+	if err := os.Chtimes(path, changedAt, changedAt); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := SaveChecked(path, []byte("editor"), NewlineLF, 0o600, opened.ModTime); !errors.Is(err, ErrChangedOnDisk) {
+		t.Fatalf("SaveChecked error = %v, want ErrChangedOnDisk", err)
+	}
+	data, err := os.ReadFile(path)
+	if err != nil || string(data) != "external" {
+		t.Fatalf("disk content = %q, %v", data, err)
+	}
+}
+
+func TestSavePreservesSymlink(t *testing.T) {
+	root := t.TempDir()
+	target := filepath.Join(root, "target.txt")
+	link := filepath.Join(root, "link.txt")
+	if err := os.WriteFile(target, []byte("before"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(target, link); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Save(link, []byte("after"), NewlineLF, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	info, err := os.Lstat(link)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if info.Mode()&os.ModeSymlink == 0 {
+		t.Fatalf("save replaced symlink: mode=%v", info.Mode())
+	}
+	data, err := os.ReadFile(target)
+	if err != nil || string(data) != "after" {
+		t.Fatalf("target content = %q, %v", data, err)
 	}
 }
 

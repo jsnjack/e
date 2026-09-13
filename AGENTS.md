@@ -25,7 +25,8 @@ editing, EditorConfig support, and availability-aware AI autocomplete.
 - `internal/activity` is the GTK-free, non-blocking operation event hub. The UI
   renders it in a persistent bottom status bar with an activity-history panel.
 - `internal/lsp` is a dependency-free JSON-RPC client for configured language
-  servers.
+  servers. The UI shares one process per project root, language, and command;
+  pipe writes are serialized away from GTK's main thread.
 - `internal/editorconfig` applies the core `.editorconfig` properties without
   introducing another parser dependency.
 - `data` contains freedesktop desktop metadata and the application icon.

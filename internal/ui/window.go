@@ -46,21 +46,31 @@ type window struct {
 	sidebarWidth        int
 	projectRoot         string
 	pendingCtrlK        bool
+	ctrlKTimer          glib.SourceHandle
 	preferences         *adw.PreferencesDialog
 	preferencesApplying bool
 
-	documents map[*adw.TabPage]*editorDocument
-	completer *ai.Completer
-	aiCancel  context.CancelFunc
-	restored  bool
-	mu        sync.Mutex
+	documents   map[*adw.TabPage]*editorDocument
+	lspSessions map[string]*lspSession
+	saveFile    func(*saveRequest) (int64, error)
+	completer   *ai.Completer
+	aiCancel    context.CancelFunc
+	restored    bool
+	mu          sync.Mutex
 }
 
 func newWindow(app *adw.Application, options Options) *window {
 	ctx, cancel := context.WithCancel(context.Background())
 	w := &window{
 		app: app, options: options, ctx: ctx, cancel: cancel,
-		documents: make(map[*adw.TabPage]*editorDocument),
+		documents:   make(map[*adw.TabPage]*editorDocument),
+		lspSessions: make(map[string]*lspSession),
+	}
+	w.saveFile = func(request *saveRequest) (int64, error) {
+		if request.force || request.expectedModTime == 0 {
+			return document.Save(request.path, request.prepared, request.newline, request.mode)
+		}
+		return document.SaveChecked(request.path, request.prepared, request.newline, request.mode, request.expectedModTime)
 	}
 	w.build()
 	w.registerActions()
@@ -77,6 +87,9 @@ func (w *window) build() {
 	w.win.SetDefaultSize(1100, 760)
 	w.win.Connect("notify::is-active", func() {
 		logging.Trace("ui: window focus changed", "active", w.win.IsActive(), "preferences", w.preferences != nil)
+		if !w.win.IsActive() {
+			w.clearPendingChord()
+		}
 	})
 	logging.Trace("ui: application window ready")
 
@@ -133,7 +146,7 @@ func (w *window) build() {
 	w.tabBar.SetView(w.tabs)
 	w.tabBar.SetAutohide(true)
 	w.tabs.ConnectClosePage(w.closePage)
-	w.tabs.Connect("notify::selected-page", func() { w.updateTitle(w.active()) })
+	w.tabs.Connect("notify::selected-page", w.selectedPageChanged)
 	logging.Trace("ui: tabs ready")
 
 	w.searchBar = gtk.NewSearchBar()
@@ -317,7 +330,7 @@ func (w *window) keyPressed(keyval, _ uint, state gdk.ModifierType) bool {
 	alt := state&gdk.AltMask != 0
 	super := state&gdk.SuperMask != 0
 	if w.pendingCtrlK {
-		w.pendingCtrlK = false
+		w.clearPendingChord()
 		if ctrl && !shift && !alt && !super && lower == gdk.KEY_s {
 			w.showShortcuts()
 			return true
@@ -325,9 +338,30 @@ func (w *window) keyPressed(keyval, _ uint, state gdk.ModifierType) bool {
 	}
 	if ctrl && !shift && !alt && !super && lower == gdk.KEY_k {
 		w.pendingCtrlK = true
+		w.ctrlKTimer = glib.TimeoutAdd(1500, func() bool {
+			w.pendingCtrlK = false
+			w.ctrlKTimer = 0
+			return false
+		})
 		return true
 	}
 	return false
+}
+
+func (w *window) clearPendingChord() {
+	w.pendingCtrlK = false
+	if w.ctrlKTimer != 0 {
+		glib.SourceRemove(w.ctrlKTimer)
+		w.ctrlKTimer = 0
+	}
+}
+
+func (w *window) selectedPageChanged() {
+	doc := w.active()
+	w.updateTitle(doc)
+	if doc != nil && w.searchBar.SearchMode() {
+		doc.search.update(w.searchEntry.Text())
+	}
 }
 
 func (w *window) toggleSidebar() {
@@ -399,9 +433,16 @@ func (w *window) restoreOrNew() {
 		slog.Warn("restore session", "err", err)
 		w.toast("Couldn’t restore the previous session")
 	}
+	var activePage *adw.TabPage
 	for i := range snapshots {
 		snapshot := snapshots[i]
-		w.newDocument(&snapshot)
+		doc := w.newDocument(&snapshot)
+		if snapshot.Active {
+			activePage = doc.page
+		}
+	}
+	if activePage != nil {
+		w.tabs.SetSelectedPage(activePage)
 	}
 	if len(w.documents) == 0 {
 		w.newDocument(nil)
@@ -603,7 +644,11 @@ func (w *window) updateTitle(doc *editorDocument) {
 		return
 	}
 	w.title.SetTitle(doc.title())
-	w.title.SetSubtitle(doc.path)
+	subtitle := doc.path
+	if doc.diagnostics > 0 {
+		subtitle = fmt.Sprintf("%s · %d diagnostics", subtitle, doc.diagnostics)
+	}
+	w.title.SetSubtitle(subtitle)
 }
 
 func (w *window) persistSession() {
@@ -613,7 +658,9 @@ func (w *window) persistSession() {
 	for index := 0; index < w.tabs.NPages(); index++ {
 		page := w.tabs.NthPage(index)
 		if doc := w.documentForPage(page); doc != nil && !doc.loading {
-			snapshots = append(snapshots, doc.snapshot())
+			snapshot := doc.snapshot()
+			snapshot.Active = sameTabPage(page, w.tabs.SelectedPage())
+			snapshots = append(snapshots, snapshot)
 		}
 	}
 	if err := document.SaveSession(w.options.Paths.StateDir, snapshots); err != nil {
@@ -699,7 +746,9 @@ func (w *window) showAbout() {
 }
 
 func (w *window) showShortcuts() {
-	w.toast("Ctrl+B sidebar · Ctrl+F find · Alt+\\ AI · Ctrl+D next match · Alt+click or Shift+Alt+↑/↓ add cursor")
+	w.showPalette("Keyboard Shortcuts", "Search shortcuts", func(deliver func([]paletteItem)) {
+		deliver(w.commandPaletteItems())
+	})
 }
 
 func (w *window) openPreferences() {
@@ -708,6 +757,10 @@ func (w *window) openPreferences() {
 	// shaded by an older dialog.
 	if w.preferences != nil {
 		logging.Trace("ui: preferences already open")
+		return
+	}
+	if w.preferencesApplying {
+		w.toast("Finishing the previous settings update")
 		return
 	}
 	logging.Trace("ui: open preferences", "active", w.win.IsActive())

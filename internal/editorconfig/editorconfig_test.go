@@ -36,4 +36,25 @@ func TestResolve(t *testing.T) {
 	}
 }
 
+func TestUnsetClearsInheritedProperty(t *testing.T) {
+	root := t.TempDir()
+	child := filepath.Join(root, "child")
+	if err := os.Mkdir(child, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(root, ".editorconfig"), []byte("root = true\n[*]\ntrim_trailing_whitespace = true\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(child, ".editorconfig"), []byte("[*]\ntrim_trailing_whitespace = unset\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	props, err := Resolve(filepath.Join(child, "main.go"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if props.TrimTrailingWhitespace != nil {
+		t.Fatalf("unset inherited value = %v, want nil", *props.TrimTrailingWhitespace)
+	}
+}
+
 func boolPtr(value bool) *bool { return &value }

@@ -1,7 +1,9 @@
 package ui
 
 import (
+	"context"
 	"fmt"
+	"path/filepath"
 	"strings"
 
 	"github.com/diamondburned/gotk4-adwaita/pkg/adw"
@@ -46,12 +48,23 @@ func (w *window) showAITransform() {
 		revision := doc.revision
 		operation := w.activityHub.Begin(activity.AI, "Transforming selection")
 		completer := w.completer
+		if doc.transformCancel != nil {
+			doc.transformCancel()
+		}
+		doc.transformGen++
+		generation := doc.transformGen
+		ctx, cancel := context.WithCancel(w.ctx)
+		doc.transformCancel = cancel
 		go func() {
-			result, err := completer.CompleteDetailed(w.ctx, ai.Request{
-				Filename: doc.path, Language: languageForPath(doc.path),
+			defer cancel()
+			result, err := completer.CompleteDetailed(ctx, ai.Request{
+				Filename: filepath.Base(doc.path), Language: languageForPath(doc.path),
 				Instruction: prompt, Selection: selected,
 			})
 			dispatch.Main(func() {
+				if generation == doc.transformGen {
+					doc.transformCancel = nil
+				}
 				if err != nil {
 					operation.Fail(err)
 					return
@@ -74,17 +87,27 @@ func (w *window) showAITransform() {
 }
 
 func (w *window) reviewAITransform(doc *editorDocument, start, end int, original, replacement string) {
-	dialog := adw.NewAlertDialog("Review AI Replacement", "The document remains unchanged until you apply this replacement.")
-	preview := gtk.NewTextView()
-	preview.SetEditable(false)
-	preview.SetMonospace(true)
-	preview.SetWrapMode(gtk.WrapWordChar)
-	preview.Buffer().SetText(replacement)
-	scroll := gtk.NewScrolledWindow()
-	scroll.SetMinContentHeight(280)
-	scroll.SetMaxContentHeight(520)
-	scroll.SetChild(preview)
-	dialog.SetExtraChild(scroll)
+	dialog := adw.NewAlertDialog("Review AI Replacement", "Compare the original and replacement before applying.")
+	comparison := gtk.NewBox(gtk.OrientationVertical, 6)
+	addPreview := func(title, text string) {
+		label := gtk.NewLabel(title)
+		label.SetXAlign(0)
+		label.AddCSSClass("heading")
+		preview := gtk.NewTextView()
+		preview.SetEditable(false)
+		preview.SetMonospace(true)
+		preview.SetWrapMode(gtk.WrapWordChar)
+		preview.Buffer().SetText(text)
+		scroll := gtk.NewScrolledWindow()
+		scroll.SetMinContentHeight(140)
+		scroll.SetMaxContentHeight(260)
+		scroll.SetChild(preview)
+		comparison.Append(label)
+		comparison.Append(scroll)
+	}
+	addPreview("Original", original)
+	addPreview("Replacement", replacement)
+	dialog.SetExtraChild(comparison)
 	dialog.AddResponse("cancel", "Reject")
 	dialog.AddResponse("apply", "Apply")
 	dialog.SetCloseResponse("cancel")
@@ -92,7 +115,11 @@ func (w *window) reviewAITransform(doc *editorDocument, start, end int, original
 	dialog.SetResponseAppearance("apply", adw.ResponseSuggested)
 	revision := doc.revision
 	dialog.ConnectResponse(func(response string) {
-		if response != "apply" || doc.closed || doc.revision != revision {
+		if response != "apply" || doc.closed {
+			return
+		}
+		if doc.revision != revision {
+			w.toast("Document changed; replacement was not applied")
 			return
 		}
 		current := doc.buffer.Text(doc.buffer.IterAtOffset(start), doc.buffer.IterAtOffset(end), true)

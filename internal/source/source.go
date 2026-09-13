@@ -62,6 +62,10 @@ static gboolean bridge_guess_language(GtkTextView *view, const char *filename, c
   guess_language_fn guess = (guess_language_fn)sym(source_lib, "gtk_source_language_manager_guess_language");
   buffer_set_language_fn set_language = (buffer_set_language_fn)sym(source_lib, "gtk_source_buffer_set_language");
   if (!get_manager || !guess || !set_language) return FALSE;
+  if ((!filename || !*filename) && (!content_type || !*content_type)) {
+    set_language((GtkSourceBuffer *)gtk_text_view_get_buffer(view), NULL);
+    return FALSE;
+  }
   GtkSourceLanguage *language = guess(get_manager(), filename, content_type);
   set_language((GtkSourceBuffer *)gtk_text_view_get_buffer(view), language);
   return language != NULL;

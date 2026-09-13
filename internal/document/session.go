@@ -19,6 +19,7 @@ type Snapshot struct {
 	Modified bool    `json:"modified"`
 	Cursor   int     `json:"cursor"`
 	Newline  Newline `json:"newline"`
+	Active   bool    `json:"active,omitempty"`
 }
 
 type sessionTab struct {
@@ -29,6 +30,7 @@ type sessionTab struct {
 	Modified bool    `json:"modified"`
 	Cursor   int     `json:"cursor"`
 	Newline  Newline `json:"newline"`
+	Active   bool    `json:"active,omitempty"`
 }
 
 // SaveSession persists open tabs and recovery copies for unsaved content.
@@ -43,7 +45,11 @@ func SaveSession(stateDir string, snapshots []Snapshot) error {
 	wanted := make(map[string]bool)
 	tabs := make([]sessionTab, 0, len(snapshots))
 	for _, snapshot := range snapshots {
-		tab := sessionTab{ID: snapshot.ID, Path: snapshot.Path, Title: snapshot.Title, Modified: snapshot.Modified, Cursor: snapshot.Cursor, Newline: snapshot.Newline}
+		tab := sessionTab{
+			ID: snapshot.ID, Path: snapshot.Path, Title: snapshot.Title,
+			Modified: snapshot.Modified, Cursor: snapshot.Cursor,
+			Newline: snapshot.Newline, Active: snapshot.Active,
+		}
 		if snapshot.Modified || snapshot.Path == "" {
 			tab.Recovery = filepath.Join("recovery", snapshot.ID+".txt")
 			fullPath := filepath.Join(stateDir, tab.Recovery)
@@ -91,7 +97,11 @@ func LoadSession(stateDir string) ([]Snapshot, error) {
 	}
 	out := make([]Snapshot, 0, len(tabs))
 	for _, tab := range tabs {
-		snapshot := Snapshot{ID: tab.ID, Path: tab.Path, Title: tab.Title, Modified: tab.Modified, Cursor: tab.Cursor, Newline: tab.Newline}
+		snapshot := Snapshot{
+			ID: tab.ID, Path: tab.Path, Title: tab.Title,
+			Modified: tab.Modified, Cursor: tab.Cursor,
+			Newline: tab.Newline, Active: tab.Active,
+		}
 		if tab.Recovery != "" {
 			recoveryPath := filepath.Join(stateDir, filepath.Clean(tab.Recovery))
 			if filepath.Dir(recoveryPath) != filepath.Join(stateDir, "recovery") {

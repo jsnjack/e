@@ -1,10 +1,12 @@
 package ui
 
 import (
+	"bytes"
 	"context"
 	"os"
 	"path/filepath"
 	"runtime"
+	"strings"
 	"testing"
 	"time"
 
@@ -16,6 +18,7 @@ import (
 	"github.com/jsnjack/e/internal/activity"
 	"github.com/jsnjack/e/internal/ai"
 	"github.com/jsnjack/e/internal/config"
+	"github.com/jsnjack/e/internal/lsp"
 )
 
 type runtimeProvider struct{}
@@ -61,6 +64,15 @@ func TestEditorRuntimeSmoke(t *testing.T) {
 	if w.tabs.NPages() != 1 || w.active() != doc {
 		t.Fatalf("initial document was not selected")
 	}
+	loadComplete := false
+	doc.insertChunks(bytes.Repeat([]byte("load\n"), 20_000), false, 0, nil, func(ok bool) { loadComplete = ok })
+	if doc.view.Widget.Editable() {
+		t.Fatal("document remained editable while chunked loading was active")
+	}
+	waitForUI(t, func() bool { return loadComplete })
+	if !doc.view.Widget.Editable() {
+		t.Fatal("document did not become editable after loading")
+	}
 	if w.activity.document.Text() != "New · Plain Text" ||
 		w.activity.cursor.Text() != "Ln 1, Col 1" || !w.activity.bar.Visible() {
 		t.Fatal("persistent document status bar was not initialized")
@@ -69,6 +81,23 @@ func TestEditorRuntimeSmoke(t *testing.T) {
 	if !w.keyPressed(gdk.KEY_k, 0, gdk.ControlMask) || !w.keyPressed(gdk.KEY_s, 0, gdk.ControlMask) {
 		t.Fatal("Ctrl+K Ctrl+S shortcut chord was not handled")
 	}
+	if !w.keyPressed(gdk.KEY_k, 0, gdk.ControlMask) {
+		t.Fatal("Ctrl+K shortcut prefix was not handled")
+	}
+	waitForUI(t, func() bool { return !w.pendingCtrlK })
+
+	doc.path = filepath.Join(root, "issues.go")
+	doc.lspURI = lsp.FileURI(doc.path)
+	w.setDiagnostics(doc.lspURI, []lsp.Diagnostic{{Message: "one"}, {Message: "two"}})
+	waitForUI(t, func() bool { return strings.Contains(w.title.Subtitle(), "2 diagnostics") })
+	doc.buffer.PlaceCursor(doc.buffer.EndIter())
+	if !strings.Contains(w.title.Subtitle(), "2 diagnostics") {
+		t.Fatal("cursor update discarded the diagnostics count")
+	}
+	w.setDiagnostics(doc.lspURI, nil)
+	waitForUI(t, func() bool { return w.title.Subtitle() == doc.path })
+	doc.path, doc.lspURI = "", ""
+	doc.updatePresentation()
 
 	w.openPreferences()
 	preferences := w.preferences
@@ -124,6 +153,7 @@ func TestEditorRuntimeSmoke(t *testing.T) {
 	w.tabs.ClosePage(w.tabs.SelectedPage())
 
 	setBufferText(doc, "one two one")
+	doc.search.query = "one"
 	doc.search.matches = findMatches("one two one", "one")
 	doc.search.current = 0
 	doc.search.replaceCurrent("ONE")
@@ -136,6 +166,13 @@ func TestEditorRuntimeSmoke(t *testing.T) {
 	if got := bufferText(doc.buffer); got != "1 two 1" {
 		t.Fatalf("replace all = %q", got)
 	}
+	doc.search.matches = findMatches("1 two 1", "1")
+	doc.search.current = 0
+	doc.search.update("two")
+	if len(doc.search.matches) != 0 {
+		t.Fatal("changing the search query left stale replace ranges active")
+	}
+	doc.search.update("")
 
 	setBufferText(doc, "cat dog cat")
 	doc.buffer.PlaceCursor(doc.buffer.IterAtOffset(1))
@@ -148,6 +185,13 @@ func TestEditorRuntimeSmoke(t *testing.T) {
 		t.Fatalf("occurrence edit = %q", got)
 	}
 	doc.clearMultipleSelections()
+	setBufferText(doc, "cat dog cat")
+	doc.buffer.PlaceCursor(doc.buffer.IterAtOffset(1))
+	doc.selectNextOccurrence()
+	doc.buffer.SetText("changed elsewhere")
+	if len(doc.multiCursors) != 0 {
+		t.Fatal("an external buffer edit left stale multiple cursors active")
+	}
 
 	setBufferText(doc, "a\nb\nc")
 	doc.buffer.PlaceCursor(doc.buffer.IterAtOffset(0))
@@ -247,6 +291,49 @@ func TestEditorRuntimeSmoke(t *testing.T) {
 	if got := bufferText(doc.buffer); got != "prefix completion" {
 		t.Fatalf("redo completion = %q", got)
 	}
+
+	setBufferText(doc, "fmt.Pr")
+	doc.buffer.PlaceCursor(doc.buffer.EndIter())
+	doc.showCompletionEdit("intf", "Printf", 6, 4, 6)
+	doc.acceptCompletion(false)
+	if got := bufferText(doc.buffer); got != "fmt.Printf" {
+		t.Fatalf("LSP replacement completion = %q", got)
+	}
+	setBufferText(doc, "😀x")
+	if offset, ok := doc.offsetForLSPPosition(lsp.Position{Line: 0, Character: 2}); !ok || offset != 1 {
+		t.Fatalf("UTF-16 LSP offset = %d, %v, want 1, true", offset, ok)
+	}
+
+	originalSave := w.saveFile
+	started := make(chan string, 2)
+	release := make(chan struct{}, 2)
+	w.saveFile = func(request *saveRequest) (int64, error) {
+		started <- string(request.prepared)
+		<-release
+		return time.Now().UnixNano(), nil
+	}
+	queuedPath := filepath.Join(root, "queued.txt")
+	doc.path = queuedPath
+	doc.modTime = 1
+	doc.buffer.SetText("first")
+	doc.save(queuedPath)
+	if got := waitForString(t, started); got != "first" {
+		t.Fatalf("first queued save = %q", got)
+	}
+	doc.buffer.SetText("second")
+	doc.save(queuedPath)
+	select {
+	case got := <-started:
+		t.Fatalf("second save started before first completed: %q", got)
+	default:
+	}
+	release <- struct{}{}
+	if got := waitForString(t, started); got != "second" {
+		t.Fatalf("second queued save = %q", got)
+	}
+	release <- struct{}{}
+	waitForUI(t, func() bool { return !doc.saveRunning && len(doc.saveQueue) == 0 })
+	w.saveFile = originalSave
 
 	doc.path = filepath.Join(root, "preview.md")
 	setBufferText(doc, "# Preview")
@@ -376,6 +463,25 @@ func waitForUI(t *testing.T, condition func() bool) {
 	if !condition() {
 		t.Fatal("timed out waiting for UI operation")
 	}
+}
+
+func waitForString(t *testing.T, values <-chan string) string {
+	t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	mainContext := glib.MainContextDefault()
+	for time.Now().Before(deadline) {
+		select {
+		case value := <-values:
+			return value
+		default:
+		}
+		for mainContext.Pending() {
+			mainContext.Iteration(false)
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	t.Fatal("timed out waiting for string value")
+	return ""
 }
 
 func containsAccelerator(values []string, wanted string) bool {

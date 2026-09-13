@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"os"
@@ -64,18 +65,23 @@ var rootCmd = &cobra.Command{
 			return fmt.Errorf("configure autocomplete: %w", err)
 		}
 		var completer *ai.Completer
-		if cfg.AI.Enabled && len(providers) > 0 {
+		if cfg.AI.Enabled && cfg.AI.Consented && len(providers) > 0 {
 			completer = ai.NewCompleter(providers)
 		}
 		slog.Info("e starting", "version", Version, "files", len(args))
-		rebuild := func(next config.Config, keys map[string]string) (*ai.Completer, error) {
+		rebuild := func(next config.Config, keys map[string]string, forgotten []string) (*ai.Completer, error) {
+			for _, endpoint := range forgotten {
+				if err := keyring.Delete(aiKeyringService, endpoint); err != nil && !errors.Is(err, keyring.ErrNotFound) {
+					return nil, fmt.Errorf("delete API key: %w", err)
+				}
+			}
 			for endpoint, key := range keys {
 				if err := keyring.Set(aiKeyringService, endpoint, key); err != nil {
 					return nil, fmt.Errorf("store API key: %w", err)
 				}
 			}
 			providers, err := ai.NewProviders(next.AI.Chain, lookupAIKey)
-			if err != nil || !next.AI.Enabled || len(providers) == 0 {
+			if err != nil || !next.AI.Enabled || !next.AI.Consented || len(providers) == 0 {
 				return nil, err
 			}
 			return ai.NewCompleter(providers), nil

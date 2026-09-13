@@ -12,6 +12,19 @@ type fakeProvider struct {
 	err   error
 }
 
+type probingProvider struct {
+	started chan struct{}
+	release chan struct{}
+}
+
+func (p probingProvider) Complete(context.Context, Request) (string, error) { return "ready", nil }
+func (p probingProvider) Healthy(context.Context) error {
+	close(p.started)
+	<-p.release
+	return nil
+}
+func (p probingProvider) Label() string { return "probing" }
+
 func (p fakeProvider) Complete(context.Context, Request) (string, error) { return p.text, p.err }
 func (p fakeProvider) Healthy(context.Context) error                     { return p.err }
 func (p fakeProvider) Label() string                                     { return p.label }
@@ -41,6 +54,20 @@ func TestChainFallback(t *testing.T) {
 				t.Fatalf("fallback = %v, want %v", fallback, tc.fallback)
 			}
 		})
+	}
+}
+
+func TestAvailabilityProbeDoesNotTemporarilyDisableProvider(t *testing.T) {
+	provider := probingProvider{started: make(chan struct{}), release: make(chan struct{})}
+	chain := NewChain([]Provider{provider})
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	chain.Start(ctx)
+	<-provider.started
+	text, err := chain.Complete(ctx, Request{Prefix: "x"})
+	close(provider.release)
+	if err != nil || text != "ready" {
+		t.Fatalf("completion during probe = %q, %v", text, err)
 	}
 }
 

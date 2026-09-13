@@ -48,32 +48,44 @@ type editorDocument struct {
 	previewVisible bool
 	previewTimer   *time.Timer
 	previewGen     uint64
+	previewBusy    bool
+	previewPending bool
 
-	id       string
-	path     string
-	newline  document.Newline
-	mode     os.FileMode
-	modTime  int64
-	props    editorconfig.Properties
-	loading  bool
-	closed   bool
-	revision uint64
-	bulkEdit bool
+	id          string
+	path        string
+	newline     document.Newline
+	mode        os.FileMode
+	modTime     int64
+	props       editorconfig.Properties
+	loading     bool
+	closed      bool
+	revision    uint64
+	bulkEdit    bool
+	diagnostics int
 
 	completionTimer  *time.Timer
 	completionCancel context.CancelFunc
+	transformCancel  context.CancelFunc
+	transformGen     uint64
 	completionGen    uint64
 	ghostText        string
 	ghostOffset      int
+	completionText   string
+	replaceStart     int
+	replaceEnd       int
 
-	lspClient *lsp.Client
-	lspURI    string
-	lspLang   string
-	lspCancel context.CancelFunc
-	lspReady  bool
-	lspVer    int
-	watching  bool
-	diskWarn  bool
+	saveRunning bool
+	saveQueue   []*saveRequest
+
+	lspClient  *lsp.Client
+	lspURI     string
+	lspLang    string
+	lspSession string
+	lspReady   bool
+	lspOpening bool
+	lspVer     int
+	watching   bool
+	diskWarn   bool
 
 	multiCursors        []multiCursor
 	multiTag            *gtk.TextTag
@@ -83,6 +95,28 @@ type editorDocument struct {
 	brandRefreshPending bool
 	brandRefreshStart   int
 	brandRefreshEnd     int
+}
+
+type saveRequest struct {
+	path            string
+	text            []byte
+	prepared        []byte
+	newline         document.Newline
+	mode            os.FileMode
+	props           editorconfig.Properties
+	expectedModTime int64
+	revision        uint64
+	cursor          int
+	force           bool
+	after           func(bool)
+}
+
+type lspSession struct {
+	key    string
+	client *lsp.Client
+	cancel context.CancelFunc
+	docs   map[*editorDocument]bool
+	ready  bool
 }
 
 func (w *window) newDocument(snapshot *document.Snapshot) *editorDocument {
@@ -165,13 +199,20 @@ func (d *editorDocument) connectSignals() {
 			return
 		}
 		d.revision++
+		if d.transformCancel != nil {
+			d.transformCancel()
+			d.transformCancel = nil
+		}
 		if d.bulkEdit {
 			return
+		}
+		if len(d.multiCursors) > 0 {
+			d.clearMultipleSelections()
 		}
 		d.dismissCompletion()
 		d.scheduleCompletion()
 		d.scheduleMarkdownPreview()
-		if d.search != nil && d.search.query != "" {
+		if d.search != nil && d.search.query != "" && !d.search.replacing {
 			d.search.scheduleRefresh()
 		}
 	})
@@ -274,6 +315,7 @@ func (d *editorDocument) updatePresentation() {
 
 func (d *editorDocument) load(path string) {
 	d.loading = true
+	d.view.Widget.SetEditable(false)
 	d.page.SetLoading(true)
 	d.page.SetTitle(filepath.Base(path))
 	operation := d.window.activityHub.Begin(activity.File, "Opening "+filepath.Base(path))
@@ -290,6 +332,7 @@ func (d *editorDocument) load(path string) {
 			}
 			if err != nil {
 				d.loading = false
+				d.view.Widget.SetEditable(true)
 				d.page.SetLoading(false)
 				operation.Fail(err)
 				slog.Warn("open document", "path", path, "err", err)
@@ -314,6 +357,7 @@ func (d *editorDocument) load(path string) {
 
 func (d *editorDocument) insertChunks(data []byte, modified bool, cursor int, progress func(int, int), done func(bool)) {
 	d.loading = true
+	d.view.Widget.SetEditable(false)
 	d.page.SetLoading(true)
 	d.view.SetHighlighting(false)
 	d.buffer.BeginIrreversibleAction()
@@ -321,6 +365,7 @@ func (d *editorDocument) insertChunks(data []byte, modified bool, cursor int, pr
 	offset := 0
 	glib.IdleAdd(func() bool {
 		if d.closed {
+			d.buffer.EndIrreversibleAction()
 			if done != nil {
 				done(false)
 			}
@@ -347,12 +392,33 @@ func (d *editorDocument) insertChunks(data []byte, modified bool, cursor int, pr
 		d.buffer.SetModified(modified)
 		d.buffer.PlaceCursor(d.buffer.IterAtOffset(min(cursor, d.buffer.CharCount())))
 		d.loading = false
+		d.view.Widget.SetEditable(true)
 		d.page.SetLoading(false)
 		d.updatePresentation()
 		d.scheduleMarkdownPreview()
 		if done != nil {
 			done(true)
 		}
+		return false
+	})
+}
+
+func (d *editorDocument) textSnapshotAsync(valid func() bool, done func(string)) {
+	total := d.buffer.CharCount()
+	offset := 0
+	var text strings.Builder
+	text.Grow(total)
+	glib.IdleAdd(func() bool {
+		if d.closed || !valid() {
+			return false
+		}
+		if offset < total {
+			end := min(offset+loadChunkSize, total)
+			text.WriteString(d.buffer.Text(d.buffer.IterAtOffset(offset), d.buffer.IterAtOffset(end), true))
+			offset = end
+			return true
+		}
+		done(text.String())
 		return false
 	})
 }
@@ -377,61 +443,179 @@ func (d *editorDocument) applyEditorConfig() {
 func (d *editorDocument) save(path string) { d.saveThen(path, nil) }
 
 func (d *editorDocument) saveThen(path string, after func(bool)) {
+	if path != d.path {
+		go func() {
+			props, err := editorconfig.Resolve(path)
+			dispatch.Main(func() {
+				if d.closed {
+					if after != nil {
+						after(false)
+					}
+					return
+				}
+				if err != nil {
+					slog.Debug("resolve EditorConfig before Save As", "path", path, "err", err)
+					props = editorconfig.Properties{}
+				}
+				d.queueSave(path, props, after)
+			})
+		}()
+		return
+	}
+	d.queueSave(path, d.props, after)
+}
+
+func (d *editorDocument) queueSave(path string, props editorconfig.Properties, after func(bool)) {
 	start, end := d.buffer.Bounds()
 	text := []byte(d.buffer.Text(start, end, true))
-	prepared := document.PrepareSave(text, boolOr(d.props.TrimTrailingWhitespace, false), boolOr(d.props.InsertFinalNewline, false))
-	saveRevision := d.revision
-	cursorOffset := d.buffer.IterAtMark(d.buffer.GetInsert()).Offset()
-	newline, mode := d.newline, d.mode
+	prepared := document.PrepareSave(text, boolOr(props.TrimTrailingWhitespace, false), boolOr(props.InsertFinalNewline, false))
+	newline := newlineFromConfig(props.EndOfLine, d.newline)
+	expectedModTime := int64(0)
+	if path == d.path {
+		expectedModTime = d.modTime
+	}
+	d.saveQueue = append(d.saveQueue, &saveRequest{
+		path: path, text: text, prepared: prepared,
+		newline: newline, mode: d.mode, props: props, expectedModTime: expectedModTime,
+		revision: d.revision, cursor: d.buffer.IterAtMark(d.buffer.GetInsert()).Offset(),
+		after: after,
+	})
+	d.runNextSave()
+}
+
+func (d *editorDocument) runNextSave() {
+	if d.saveRunning || len(d.saveQueue) == 0 || d.closed {
+		return
+	}
+	request := d.saveQueue[0]
+	d.saveQueue = d.saveQueue[1:]
+	d.saveRunning = true
 	d.page.SetLoading(true)
-	operation := d.window.activityHub.Begin(activity.File, "Saving "+filepath.Base(path))
+	operation := d.window.activityHub.Begin(activity.File, "Saving "+filepath.Base(request.path))
 	go func() {
-		modTime, err := document.Save(path, prepared, newline, mode)
+		modTime, err := d.window.saveFile(request)
 		dispatch.Main(func() {
+			d.saveRunning = false
 			if d.closed {
 				operation.Cancel()
-				if after != nil {
-					after(false)
+				if request.after != nil {
+					request.after(false)
 				}
 				return
 			}
-			d.page.SetLoading(false)
-			if err != nil {
-				slog.Warn("save document", "path", path, "err", err)
+			if errors.Is(err, document.ErrChangedOnDisk) {
 				operation.Fail(err)
-				if after != nil {
-					after(false)
-				}
+				d.confirmOverwrite(request)
 				return
 			}
-			d.path, d.modTime = path, modTime
+			if err != nil {
+				slog.Warn("save document", "path", request.path, "err", err)
+				operation.Fail(err)
+				if request.after != nil {
+					request.after(false)
+				}
+				d.page.SetLoading(len(d.saveQueue) > 0)
+				d.runNextSave()
+				return
+			}
+			oldPath := d.path
+			d.modTime = modTime
+			if oldPath != request.path {
+				d.applyPathChange(request.path, request.props)
+			} else {
+				d.path = request.path
+			}
 			d.diskWarn = false
-			savedCurrentRevision := d.revision == saveRevision
+			for _, queued := range d.saveQueue {
+				if queued.path == request.path && !queued.force {
+					queued.expectedModTime = modTime
+				}
+			}
+			savedCurrentRevision := d.revision == request.revision
 			if savedCurrentRevision {
-				if !bytes.Equal(text, prepared) {
+				if !bytes.Equal(request.text, request.prepared) {
 					d.loading = true
 					d.buffer.BeginUserAction()
-					d.buffer.SetText(string(prepared))
-					d.buffer.PlaceCursor(d.buffer.IterAtOffset(min(cursorOffset, d.buffer.CharCount())))
+					d.buffer.SetText(string(request.prepared))
+					d.buffer.PlaceCursor(d.buffer.IterAtOffset(min(request.cursor, d.buffer.CharCount())))
 					d.buffer.EndUserAction()
 					d.loading = false
 				}
 				d.buffer.SetModified(false)
 			}
-			d.view.SetLanguage(path, "")
+			d.view.SetLanguage(request.path, "")
 			d.updatePresentation()
-			operation.Finish(humanByteCount(len(prepared)), "", false)
+			operation.Finish(humanByteCount(len(request.prepared)), "", false)
 			if d.lspClient == nil {
 				d.startLSP()
-			} else if err := d.lspClient.Save(d.lspURI); err != nil {
-				slog.Debug("LSP save", "err", err)
+			} else if oldPath == request.path && d.lspReady {
+				if err := d.lspClient.Save(d.lspURI); err != nil {
+					slog.Debug("LSP save", "err", err)
+				}
 			}
 			d.startExternalWatch()
-			if after != nil {
-				after(savedCurrentRevision)
+			if request.after != nil {
+				request.after(savedCurrentRevision)
 			}
+			d.page.SetLoading(len(d.saveQueue) > 0)
+			d.runNextSave()
 		})
 	}()
+}
+
+func (d *editorDocument) changePath(path string) {
+	d.applyPathChange(path, editorconfig.Properties{})
+	go func() {
+		props, err := editorconfig.Resolve(path)
+		dispatch.Main(func() {
+			if d.closed || d.path != path {
+				return
+			}
+			if err != nil {
+				slog.Debug("resolve EditorConfig after path change", "path", path, "err", err)
+				return
+			}
+			d.props = props
+			d.applyEditorConfig()
+		})
+	}()
+}
+
+func (d *editorDocument) applyPathChange(path string, props editorconfig.Properties) {
+	d.stopLSP()
+	d.path = path
+	d.props = props
+	d.applyEditorConfig()
+	d.view.SetLanguage(path, "")
+	d.updatePresentation()
+	d.startLSP()
+}
+
+func (d *editorDocument) confirmOverwrite(request *saveRequest) {
+	dialog := adw.NewAlertDialog(
+		"File changed on disk",
+		fmt.Sprintf("“%s” was changed by another program. Saving will overwrite those changes.", filepath.Base(request.path)),
+	)
+	dialog.AddResponse("cancel", "Cancel")
+	dialog.AddResponse("overwrite", "Save Anyway")
+	dialog.SetCloseResponse("cancel")
+	dialog.SetResponseAppearance("overwrite", adw.ResponseDestructive)
+	dialog.ConnectResponse(func(response string) {
+		if response == "overwrite" && !d.closed {
+			request.force = true
+			for _, queued := range d.saveQueue {
+				if queued.path == request.path {
+					queued.force = true
+				}
+			}
+			d.saveQueue = append([]*saveRequest{request}, d.saveQueue...)
+		} else if request.after != nil {
+			request.after(false)
+		}
+		d.page.SetLoading(len(d.saveQueue) > 0)
+		d.runNextSave()
+	})
+	dialog.Present(d.window.win)
 }
 
 func (d *editorDocument) snapshot() document.Snapshot {
@@ -444,11 +628,15 @@ func (d *editorDocument) snapshot() document.Snapshot {
 }
 
 func (d *editorDocument) scheduleCompletion() {
-	if d.window.completer == nil || !d.window.options.Config.AI.Enabled || len(d.multiCursors) > 1 {
+	if d.window.completer == nil || !d.window.options.Config.AI.Enabled || !d.window.options.Config.AI.Consented || len(d.multiCursors) > 1 {
 		return
 	}
 	if d.completionTimer != nil {
 		d.completionTimer.Stop()
+	}
+	if d.transformCancel != nil {
+		d.transformCancel()
+		d.transformCancel = nil
 	}
 	if d.search != nil && d.search.timer != nil {
 		d.search.timer.Stop()
@@ -483,7 +671,7 @@ func (d *editorDocument) requestCompletion(manual bool) {
 	end := d.buffer.IterAtOffset(min(d.buffer.CharCount(), offset+maxSuffix))
 	req := ai.Request{
 		Prefix: d.buffer.Text(start, cursor, true), Suffix: d.buffer.Text(cursor, end, true),
-		Filename: d.path, Language: languageForPath(d.path),
+		Filename: filepath.Base(d.path), Language: languageForPath(d.path),
 	}
 	if strings.TrimSpace(req.Prefix) == "" && !manual {
 		return
@@ -525,17 +713,25 @@ func (d *editorDocument) requestCompletion(manual bool) {
 
 func (d *editorDocument) showCompletion(text string, offset int) {
 	text = inlineCompletionText(text)
-	if text == "" {
+	d.showCompletionEdit(text, text, offset, offset, offset)
+}
+
+func (d *editorDocument) showCompletionEdit(display, insertion string, offset, replaceStart, replaceEnd int) {
+	display = inlineCompletionText(display)
+	insertion = inlineCompletionText(insertion)
+	if display == "" || replaceStart < 0 || replaceEnd < replaceStart || replaceEnd > d.buffer.CharCount() {
 		return
 	}
 	logging.Trace("ui: show completion", "active", d.window.win.IsActive(),
 		"sensitive", d.window.content.IsSensitive(), "preferences", d.window.preferences != nil,
-		"characters", utf8.RuneCountInString(text), "lines", strings.Count(text, "\n")+1)
-	if !d.ghost.show(text, d.buffer.IterAtOffset(offset)) {
+		"characters", utf8.RuneCountInString(display), "lines", strings.Count(display, "\n")+1)
+	if !d.ghost.show(display, d.buffer.IterAtOffset(offset)) {
 		d.ghostText = ""
 		return
 	}
-	d.ghostText, d.ghostOffset = text, offset
+	d.ghostText, d.ghostOffset = display, offset
+	d.completionText = insertion
+	d.replaceStart, d.replaceEnd = replaceStart, replaceEnd
 	presentation := "inline"
 	if d.ghost.preview {
 		presentation = "below-line"
@@ -550,22 +746,35 @@ func (d *editorDocument) dismissCompletion() {
 		d.completionCancel = nil
 	}
 	d.ghostText = ""
+	d.completionText = ""
+	d.replaceStart, d.replaceEnd = 0, 0
 	if d.ghost != nil {
 		d.ghost.hide()
 	}
 }
 
 func (d *editorDocument) acceptCompletion(oneWord bool) {
-	text := d.ghostText
+	text := d.completionText
 	if oneWord {
-		text = completionWord(text)
+		if d.replaceEnd > d.replaceStart {
+			existing := d.buffer.Text(d.buffer.IterAtOffset(d.replaceStart), d.buffer.IterAtOffset(d.replaceEnd), true)
+			if strings.HasPrefix(text, existing) {
+				text = existing + completionWord(strings.TrimPrefix(text, existing))
+			}
+		} else {
+			text = completionWord(text)
+		}
 	}
 	if text == "" {
 		return
 	}
+	start, end := d.replaceStart, d.replaceEnd
 	d.dismissCompletion()
 	d.buffer.BeginUserAction()
-	d.buffer.Insert(d.buffer.IterAtMark(d.buffer.GetInsert()), text)
+	if end > start {
+		d.buffer.Delete(d.buffer.IterAtOffset(start), d.buffer.IterAtOffset(end))
+	}
+	d.buffer.Insert(d.buffer.IterAtOffset(start), text)
 	d.buffer.EndUserAction()
 }
 
@@ -588,29 +797,75 @@ func (d *editorDocument) startLSP() {
 		return
 	}
 	root := filepath.Dir(d.path)
-	client := lsp.New(command, args, root, d.setDiagnostics)
-	d.lspClient = client
+	if d.window.projectRoot != "" {
+		if relative, err := filepath.Rel(d.window.projectRoot, d.path); err == nil &&
+			relative != ".." && !strings.HasPrefix(relative, ".."+string(filepath.Separator)) {
+			root = d.window.projectRoot
+		}
+	}
+	key := strings.Join(append([]string{root, language, command}, args...), "\x00")
+	session := d.window.lspSessions[key]
+	if session == nil {
+		ctx, cancel := context.WithCancel(d.window.ctx)
+		session = &lspSession{
+			key: key, client: lsp.New(command, args, root, d.window.setDiagnostics),
+			cancel: cancel, docs: make(map[*editorDocument]bool),
+		}
+		d.window.lspSessions[key] = session
+		go func() {
+			err := session.client.Start(ctx)
+			dispatch.Main(func() {
+				current := d.window.lspSessions[key]
+				if current != session {
+					return
+				}
+				if err != nil {
+					slog.Debug("start LSP", "language", language, "err", err)
+					for doc := range session.docs {
+						doc.lspClient = nil
+						doc.lspSession = ""
+						doc.lspOpening = false
+					}
+					delete(d.window.lspSessions, key)
+					return
+				}
+				session.ready = true
+				for doc := range session.docs {
+					doc.openLSPDocument()
+				}
+			})
+		}()
+	}
+	session.docs[d] = true
+	d.lspClient = session.client
+	d.lspSession = key
 	d.lspURI, d.lspLang = lsp.FileURI(d.path), language
-	ctx, cancel := context.WithCancel(d.window.ctx)
-	d.lspCancel = cancel
-	start, end := d.buffer.Bounds()
-	text := d.buffer.Text(start, end, true)
-	go func() {
-		if err := client.Start(ctx); err != nil {
-			slog.Debug("start LSP", "language", language, "err", err)
+	if session.ready {
+		d.openLSPDocument()
+	}
+}
+
+func (d *editorDocument) openLSPDocument() {
+	if d.closed || d.lspClient == nil || d.lspReady || d.lspOpening {
+		return
+	}
+	d.lspOpening = true
+	client, sessionKey, revision := d.lspClient, d.lspSession, d.revision
+	d.textSnapshotAsync(func() bool {
+		return !d.closed && d.lspClient == client && d.lspSession == sessionKey
+	}, func(text string) {
+		d.lspOpening = false
+		if d.revision != revision {
+			d.openLSPDocument()
 			return
 		}
-		if err := client.Open(d.lspURI, language, 1, text); err != nil {
-			slog.Debug("open LSP document", "language", language, "err", err)
+		if err := client.Open(d.lspURI, d.lspLang, 1, text); err != nil {
+			slog.Debug("open LSP document", "language", d.lspLang, "err", err)
 			return
 		}
-		dispatch.Main(func() {
-			if !d.closed {
-				d.lspVer = 1
-				d.lspReady = true
-			}
-		})
-	}()
+		d.lspVer = 1
+		d.lspReady = true
+	})
 }
 
 func (d *editorDocument) requestLSPCompletion() {
@@ -632,21 +887,101 @@ func (d *editorDocument) requestLSPCompletion() {
 		if len(items) == 0 {
 			return
 		}
-		text := items[0].InsertText
+		item := items[0]
 		dispatch.Main(func() {
-			if !d.closed && d.buffer.IterAtMark(d.buffer.GetInsert()).Offset() == offset {
-				d.showCompletion(text, offset)
+			if d.closed || d.buffer.IterAtMark(d.buffer.GetInsert()).Offset() != offset {
+				return
 			}
+			display, insertion := item.InsertText, item.InsertText
+			start, end := offset, offset
+			if item.TextEdit != nil {
+				var ok bool
+				start, ok = d.offsetForLSPPosition(item.TextEdit.Range.Start)
+				if !ok {
+					return
+				}
+				end, ok = d.offsetForLSPPosition(item.TextEdit.Range.End)
+				if !ok || end != offset || start > end {
+					return
+				}
+				insertion = item.TextEdit.NewText
+				existing := d.buffer.Text(d.buffer.IterAtOffset(start), d.buffer.IterAtOffset(end), true)
+				display = insertion
+				if strings.HasPrefix(insertion, existing) {
+					display = strings.TrimPrefix(insertion, existing)
+				}
+			}
+			d.showCompletionEdit(display, insertion, offset, start, end)
 		})
 	}()
 }
 
-func (d *editorDocument) setDiagnostics(uri string, diagnostics []lsp.Diagnostic) {
+func (d *editorDocument) offsetForLSPPosition(position lsp.Position) (int, bool) {
+	start, ok := d.buffer.IterAtLine(position.Line)
+	if !ok || position.Character < 0 {
+		return 0, false
+	}
+	end := start.Copy()
+	end.ForwardToLineEnd()
+	line := d.buffer.Text(start, end, true)
+	units := 0
+	runes := 0
+	for _, value := range line {
+		if units == position.Character {
+			return start.Offset() + runes, true
+		}
+		width := 1
+		if value > 0xffff {
+			width = 2
+		}
+		if units+width > position.Character {
+			return 0, false
+		}
+		units += width
+		runes++
+	}
+	if units == position.Character {
+		return start.Offset() + runes, true
+	}
+	return 0, false
+}
+
+func (w *window) setDiagnostics(uri string, diagnostics []lsp.Diagnostic) {
 	dispatch.Main(func() {
-		if uri == d.lspURI && !d.closed && len(diagnostics) > 0 && d.window.active() == d {
-			d.window.title.SetSubtitle(fmt.Sprintf("%s · %d diagnostics", d.path, len(diagnostics)))
+		for _, doc := range w.documents {
+			if uri == doc.lspURI && !doc.closed {
+				doc.diagnostics = len(diagnostics)
+				if w.active() == doc {
+					w.updateTitle(doc)
+				}
+			}
 		}
 	})
+}
+
+func (d *editorDocument) stopLSP() {
+	if d.lspClient == nil {
+		return
+	}
+	if d.lspReady {
+		if err := d.lspClient.CloseDocument(d.lspURI); err != nil {
+			slog.Debug("close LSP document", "err", err)
+		}
+	}
+	session := d.window.lspSessions[d.lspSession]
+	if session != nil {
+		delete(session.docs, d)
+		if len(session.docs) == 0 {
+			session.cancel()
+			delete(d.window.lspSessions, session.key)
+		}
+	}
+	d.lspClient = nil
+	d.lspSession = ""
+	d.lspReady = false
+	d.lspOpening = false
+	d.lspVer = 0
+	d.diagnostics = 0
 }
 
 func (d *editorDocument) startExternalWatch() {
@@ -693,6 +1028,12 @@ func (d *editorDocument) close() {
 		return
 	}
 	d.closed = true
+	for _, request := range d.saveQueue {
+		if request.after != nil {
+			request.after(false)
+		}
+	}
+	d.saveQueue = nil
 	d.dismissCompletion()
 	if d.completionTimer != nil {
 		d.completionTimer.Stop()
@@ -700,14 +1041,7 @@ func (d *editorDocument) close() {
 	if d.previewTimer != nil {
 		d.previewTimer.Stop()
 	}
-	if d.lspReady {
-		if err := d.lspClient.CloseDocument(d.lspURI); err != nil {
-			slog.Debug("close LSP document", "err", err)
-		}
-	}
-	if d.lspCancel != nil {
-		d.lspCancel()
-	}
+	d.stopLSP()
 	if d.ghost != nil {
 		d.ghost.close()
 	}

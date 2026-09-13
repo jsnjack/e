@@ -8,7 +8,7 @@ import (
 
 func TestSessionRoundTrip(t *testing.T) {
 	dir := t.TempDir()
-	want := []Snapshot{{ID: "one", Title: "Draft", Text: []byte("hello"), Modified: true, Cursor: 3, Newline: NewlineLF}}
+	want := []Snapshot{{ID: "one", Title: "Draft", Text: []byte("hello"), Modified: true, Cursor: 3, Newline: NewlineLF, Active: true}}
 	if err := SaveSession(dir, want); err != nil {
 		t.Fatal(err)
 	}
@@ -16,7 +16,7 @@ func TestSessionRoundTrip(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(got) != 1 || string(got[0].Text) != "hello" || got[0].Cursor != 3 || !got[0].Modified {
+	if len(got) != 1 || string(got[0].Text) != "hello" || got[0].Cursor != 3 || !got[0].Modified || !got[0].Active {
 		t.Fatalf("got %+v", got)
 	}
 }
