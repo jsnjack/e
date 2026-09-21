@@ -183,7 +183,7 @@ func (d *editorDocument) configureView() {
 	d.buffer.SetEnableUndo(true)
 	d.view.EnableSpelling(cfg.SpellCheck)
 
-	d.ghost = newInlineCompletionRenderer(d.view.Widget, d.buffer)
+	d.ghost = newInlineCompletionRenderer(d.view.Widget, d.buffer, d.dismissCompletion)
 	d.configureBranding()
 
 	d.multiTag = gtk.NewTextTag("e-multiple-selection")

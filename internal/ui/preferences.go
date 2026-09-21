@@ -314,6 +314,7 @@ func preferenceSwitch(title, subtitle string, active bool) *adw.SwitchRow {
 }
 
 func (d *editorDocument) configureRuntimePreferences() {
+	d.dismissCompletion()
 	cfg := d.window.options.Config.Editor
 	d.view.SetOptions(cfg.LineNumbers, true, cfg.InsertSpaces, cfg.TabWidth, -1)
 	d.view.Widget.SetWrapMode(gtk.WrapNone)
