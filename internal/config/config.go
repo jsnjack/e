@@ -65,7 +65,6 @@ func Default() Config {
 			Enabled: false, DebounceMS: defaultDebounceMS,
 			PrefixSize: defaultPrefixSize, SuffixSize: defaultSuffixSize,
 			Chain: []Model{
-				{Name: "local-qwen", Provider: "openai", Endpoint: "https://models.example.com/v1", Protocol: "chat"},
 				{Name: "Gemma-4-E4B-it-GGUF", Provider: "openai", Endpoint: "http://localhost:13305/v1", Protocol: "chat"},
 			},
 		},

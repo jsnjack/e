@@ -14,7 +14,7 @@ func TestDefaultModelOrder(t *testing.T) {
 	if cfg.AI.Consented {
 		t.Fatal("AI data sharing must require explicit consent")
 	}
-	want := []string{"local-qwen", "Gemma-4-E4B-it-GGUF"}
+	want := []string{"Gemma-4-E4B-it-GGUF"}
 	if len(cfg.AI.Chain) != len(want) {
 		t.Fatalf("model count = %d, want %d", len(cfg.AI.Chain), len(want))
 	}
