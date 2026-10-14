@@ -484,7 +484,9 @@ func (d *editorDocument) attachRestoredFile(savedModTime int64) {
 				head := make([]byte, 3)
 				n, _ := io.ReadFull(file, head)
 				bom = bytes.Equal(head[:n], []byte{0xef, 0xbb, 0xbf})
-				_ = file.Close()
+				if err := file.Close(); err != nil {
+					logging.Trace("close restored file", "path", path, "err", err)
+				}
 			}
 		}
 		props, propsErr := editorconfig.Resolve(path)

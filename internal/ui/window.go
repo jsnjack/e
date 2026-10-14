@@ -828,7 +828,9 @@ func (w *window) scheduleSessionSave() {
 	}
 	w.sessionTimer = glib.TimeoutSecondsAdd(sessionSaveDelaySeconds, func() bool {
 		w.sessionTimer = 0
-		_ = w.persistSession(false)
+		if err := w.persistSession(false); err != nil {
+			slog.Warn("save session", "err", err)
+		}
 		return false
 	})
 }

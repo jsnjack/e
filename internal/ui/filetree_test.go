@@ -74,9 +74,11 @@ func TestProjectRootFor(t *testing.T) {
 		{"/todo.md", "/"},
 	}
 	for _, test := range tests {
-		if got := projectRootFor(test.file, exists); got != test.want {
-			t.Fatalf("projectRootFor(%q) = %q, want %q", test.file, got, test.want)
-		}
+		t.Run(test.file, func(t *testing.T) {
+			if got := projectRootFor(test.file, exists); got != test.want {
+				t.Fatalf("projectRootFor(%q) = %q, want %q", test.file, got, test.want)
+			}
+		})
 	}
 }
 

@@ -49,24 +49,40 @@ func TestNormalizeCursorsMergesOverlaps(t *testing.T) {
 }
 
 func TestFindExactMatches(t *testing.T) {
-	text := "id ID valid id_x é id"
-	if got := findExactMatches(text, "id", true); !reflect.DeepEqual(got, []textRange{{0, 2}, {19, 21}}) {
-		t.Fatalf("whole-word matches = %v", got)
+	const text = "id ID valid id_x é id"
+	tests := []struct {
+		name      string
+		wholeWord bool
+		want      []textRange
+	}{
+		{"whole word skips case and substrings", true, []textRange{{0, 2}, {19, 21}}},
+		{"substring keeps case", false, []textRange{{0, 2}, {9, 11}, {12, 14}, {19, 21}}},
 	}
-	if got := findExactMatches(text, "id", false); len(got) != 4 {
-		t.Fatalf("substring matches = %v, want 4", got)
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			if got := findExactMatches(text, "id", test.wholeWord); !reflect.DeepEqual(got, test.want) {
+				t.Fatalf("findExactMatches = %v, want %v", got, test.want)
+			}
+		})
 	}
 }
 
 func TestBestCompletion(t *testing.T) {
 	items := []lsp.Completion{{Label: "Errorf"}, {Label: "Println"}, {Label: "Printf", FilterText: "printf"}}
-	if item, ok := bestCompletion(items, "pri"); !ok || item.Label != "Println" {
-		t.Fatalf("bestCompletion(pri) = %v, %v", item.Label, ok)
+	tests := []struct {
+		name, word, want string
+		ok               bool
+	}{
+		{"first match ignoring case", "pri", "Println", true},
+		{"no match", "zzz", "", false},
+		{"empty word takes the first item", "", "Errorf", true},
 	}
-	if _, ok := bestCompletion(items, "zzz"); ok {
-		t.Fatal("bestCompletion matched an unrelated word")
-	}
-	if item, ok := bestCompletion(items, ""); !ok || item.Label != "Errorf" {
-		t.Fatalf("bestCompletion(\"\") = %v", item.Label)
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			item, ok := bestCompletion(items, test.word)
+			if ok != test.ok || item.Label != test.want {
+				t.Fatalf("bestCompletion(%q) = %q, %v, want %q, %v", test.word, item.Label, ok, test.want, test.ok)
+			}
+		})
 	}
 }

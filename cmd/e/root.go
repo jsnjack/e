@@ -123,6 +123,8 @@ func lookupAIKey(provider, endpoint string) string {
 
 func init() {
 	rootCmd.SetVersionTemplate("{{.Version}}\n")
+	// Declaring the flag stops cobra from adding its -v alias.
+	rootCmd.Flags().Bool("version", false, "Print the version and exit.")
 	flags := rootCmd.PersistentFlags()
 	flags.BoolVarP(&flagDebug, "debug", "d", false, "Write debug logs to stderr.")
 	flags.BoolVar(&flagTrace, "trace", false, "Write trace logs to "+traceLogPath+".")

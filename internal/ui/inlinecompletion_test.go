@@ -88,11 +88,29 @@ func TestExpandTabs(t *testing.T) {
 		{"\t", 0, 0, "        "},
 	}
 	for _, test := range tests {
-		if got := expandTabs(test.text, test.column, test.width); got != test.want {
-			t.Fatalf("expandTabs(%q, %d, %d) = %q, want %q", test.text, test.column, test.width, got, test.want)
-		}
+		t.Run(test.text, func(t *testing.T) {
+			if got := expandTabs(test.text, test.column, test.width); got != test.want {
+				t.Fatalf("expandTabs(%q, %d, %d) = %q, want %q", test.text, test.column, test.width, got, test.want)
+			}
+		})
 	}
-	if got := visualWidth("a\tbc", 4); got != 6 {
-		t.Fatalf("visualWidth = %d, want 6", got)
+}
+
+func TestVisualWidth(t *testing.T) {
+	tests := []struct {
+		text  string
+		width int
+		want  int
+	}{
+		{"a\tbc", 4, 6},
+		{"\t", 0, 8},
+		{"abc", 4, 3},
+	}
+	for _, test := range tests {
+		t.Run(test.text, func(t *testing.T) {
+			if got := visualWidth(test.text, test.width); got != test.want {
+				t.Fatalf("visualWidth(%q, %d) = %d, want %d", test.text, test.width, got, test.want)
+			}
+		})
 	}
 }

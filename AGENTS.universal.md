@@ -45,7 +45,7 @@ Missing tools print an install command and exit — never auto-install silently.
 make check      # full validation gate — run after every change
 make test       # tests only
 make build      # compile only
-make standards  # refresh AGENTS.universal.md from the standards repo (if present)
+make standards  # refresh all applicable convention files from the standards repo (if present)
 ```
 
 ---
@@ -188,5 +188,5 @@ breaks has no value.
 - Never change code outside the scope of the current task.
 - Never add a dependency without explicit justification and agreement.
 - Never change existing behaviour silently — always flag it first.
-- Never commit on behalf of the user.
+- Never commit or push on behalf of the user unless they explicitly ask for it.
 - Never write a commit message without an `M`/`m`/`p` version prefix.
