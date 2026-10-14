@@ -4,3 +4,4 @@
 *.rpm
 rpmbuild/
 .monova.history
+/data/com.jsnjack.e.metainfo.xml

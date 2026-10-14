@@ -21,6 +21,14 @@
   </provides>
   <content_rating type="oars-1.1"/>
   <releases>
-    <release version="0.0.0" date="2026-09-12"/>
+    <release version="@VERSION@" date="@DATE@">
+      <description>
+        <p>First public release. It includes inline AI completion with ordered
+        model failover, VS Code-style multiple cursors, a project sidebar,
+        Quick Open, a live Markdown preview, language-server completion, and
+        session recovery that saves unsaved text a few seconds after each
+        edit.</p>
+      </description>
+    </release>
   </releases>
 </component>

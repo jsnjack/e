@@ -45,7 +45,11 @@ editing, EditorConfig support, and availability-aware AI autocomplete.
   `git ls-files` inside a Git repository.
 - `internal/editorconfig` applies the core `.editorconfig` properties without
   introducing another parser dependency.
-- `data` contains freedesktop desktop metadata and the application icon.
+- `data` contains freedesktop desktop metadata and the application icon. The
+  installed metainfo is generated from `data/com.jsnjack.e.metainfo.xml.in`,
+  which carries the monova version and date in its newest release entry.
+- `packaging/e.spec` packages the prebuilt binary as an RPM. `make release`
+  builds the RPM and tarball into `dist/` and publishes them with grm.
 - `make test-ui` exercises GTK actions, shortcuts, tabs, editing, disk I/O, the
   file tree, and Markdown preview. `scripts/headless.sh` runs it in a private
   headless Weston session; `E_TEST_VISIBLE=1` uses the desktop instead.

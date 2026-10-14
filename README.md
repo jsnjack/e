@@ -55,6 +55,11 @@ targets `/usr/local` by default:
 sudo make install
 ```
 
+Each GitHub release provides an RPM and a binary tarball. Install the RPM
+with `sudo dnf install ./e-<version>-1.fc44.x86_64.rpm`. `make release` builds
+both and publishes them with [grm](https://github.com/jsnjack/grm) under the
+version that monova calculates from the commit history.
+
 ## Configuration
 
 Configuration is stored at `$XDG_CONFIG_HOME/e/config.toml`, or
