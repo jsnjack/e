@@ -1,34 +1,38 @@
 package ui
 
 import (
+	"fmt"
 	"strings"
 	"unicode"
 
-	"github.com/diamondburned/gotk4/pkg/cairo"
 	coreglib "github.com/diamondburned/gotk4/pkg/core/glib"
 	"github.com/diamondburned/gotk4/pkg/gdk/v4"
 	"github.com/diamondburned/gotk4/pkg/gtk/v4"
 	"github.com/diamondburned/gotk4/pkg/pango"
-	"github.com/diamondburned/gotk4/pkg/pangocairo"
 )
 
 const (
-	ghostAlpha               = 0.68
+	ghostAlpha               = 0.5
+	ghostHintAlpha           = 0.3
 	maxInlineCompletionRunes = 2048
 	maxInlinePrefixRunes     = 2048
 )
 
-// inlineCompletionRenderer has two safe presentations. A single-line
-// completion at the real line end is drawn beside the caret. Everything else
-// is drawn in reserved space below the paragraph. Neither path masks, redraws,
-// or restyles document text.
+// ghostCanvas draws one layout above the document text in buffer coordinates.
+type ghostCanvas interface {
+	SetGhost(layout *pango.Layout, x, y int, color *gdk.RGBA) bool
+	ClearGhost()
+}
+
+// inlineCompletionRenderer shows one line of a suggestion beside the caret at
+// a real line end. The source view draws it in its own text pass, so the
+// document layout, fonts, and colors never change. Further lines are summarized
+// by a "+N lines" hint and are still inserted on accept.
 type inlineCompletionRenderer struct {
-	view    *gtk.TextView
-	buffer  *gtk.TextBuffer
-	area    *gtk.DrawingArea
-	space   *gtk.TextTag
-	redraw  func()
-	dismiss func()
+	view     *gtk.TextView
+	canvas   ghostCanvas
+	tabWidth func() int
+	dismiss  func()
 
 	tick                  uint
 	frameClock            *gdk.FrameClock
@@ -36,115 +40,75 @@ type inlineCompletionRenderer struct {
 	viewWidth, viewHeight int
 	wrapMode              gtk.WrapMode
 
-	composed string
-	width    int
-	preview  bool
-
-	spaceStart     *gtk.TextMark
-	spaceEnd       *gtk.TextMark
-	baseBottom     int
-	extendedBottom bool
+	// text is the visible ghost text; it is empty while nothing is shown.
+	text string
 }
 
-func newInlineCompletionRenderer(view *gtk.TextView, buffer *gtk.TextBuffer, dismiss func()) *inlineCompletionRenderer {
-	renderer := &inlineCompletionRenderer{
-		view: view, buffer: buffer, baseBottom: view.BottomMargin(), dismiss: dismiss,
-	}
-	renderer.space = gtk.NewTextTag("e-inline-completion-space")
-	buffer.TagTable().Add(renderer.space)
-	renderer.area = gtk.NewDrawingArea()
-	renderer.area.AddCSSClass("editor")
-	renderer.area.AddCSSClass("inline-completion")
-	renderer.area.SetHAlign(gtk.AlignStart)
-	renderer.area.SetVAlign(gtk.AlignStart)
-	renderer.area.SetCanTarget(false)
-	renderer.area.SetVisible(false)
-	renderer.area.SetDrawFunc(renderer.draw)
-	view.AddOverlay(renderer.area, 0, 0)
-	renderer.redraw = view.QueueDraw
-	return renderer
+func newInlineCompletionRenderer(view *gtk.TextView, canvas ghostCanvas, tabWidth func() int, dismiss func()) *inlineCompletionRenderer {
+	return &inlineCompletionRenderer{view: view, canvas: canvas, tabWidth: tabWidth, dismiss: dismiss}
 }
+
+func (r *inlineCompletionRenderer) visible() bool { return r.text != "" }
 
 func (r *inlineCompletionRenderer) show(suggestion string, cursor *gtk.TextIter) bool {
 	r.hide()
-	if suggestion == "" {
+	if suggestion == "" || !cursor.EndsLine() {
 		return false
 	}
-
-	lineEnd := cursor.Copy()
-	if !lineEnd.EndsLine() {
-		lineEnd.ForwardToLineEnd()
+	shown, hint := ghostDisplay(suggestion)
+	if shown == "" && hint == "" {
+		return false
 	}
-	if cursor.Offset() == lineEnd.Offset() && !strings.ContainsAny(suggestion, "\r\n") {
-		if r.showInline(suggestion, cursor) {
-			return true
-		}
+	if strings.ContainsRune(shown, '\t') {
+		shown = expandTabs(shown, r.caretColumn(cursor), r.tabWidth())
 	}
-	r.showPreview(suggestion, cursor, lineEnd)
-	return true
-}
 
-func (r *inlineCompletionRenderer) showInline(suggestion string, cursor *gtk.TextIter) bool {
-	r.preview = false
 	displayStart := cursor.Copy()
 	r.view.BackwardDisplayLineStart(displayStart)
-	// Keep long display lines in a viewport-sized preview.
-	if cursor.Offset()-displayStart.Offset() > maxInlinePrefixRunes {
-		return false
-	}
-	// Pango treats a zero foreground alpha as an unset alpha. Including the
-	// document prefix in this layout would paint it a second time.
-	r.composed = suggestion
-
-	startRect := r.view.IterLocation(displayStart)
 	caret, _ := r.view.CursorLocations(cursor)
-	visible := r.view.VisibleRect()
-	r.width = visible.X() + visible.Width() - caret.X() - r.view.RightMargin()
-	// A right-to-left paragraph or a full line has no safe space to its
-	// right. Tabs need the paragraph's tab origin, so preview them as well.
-	if caret.X() < startRect.X() || r.width <= 0 || strings.ContainsRune(suggestion, '\t') {
+	// A right-to-left paragraph has no safe space to the right of the caret.
+	if caret.X() < r.view.IterLocation(displayStart).X() {
 		return false
 	}
-	if width, _ := r.layout().PixelSize(); width > r.width {
+
+	text := shown + hint
+	layout := r.view.CreatePangoLayout(text)
+	if r.view.WrapMode() != gtk.WrapNone {
+		visible := r.view.VisibleRect()
+		width := visible.X() + visible.Width() - r.view.RightMargin() - caret.X()
+		if width <= 0 {
+			return false
+		}
+		layout.SetWidth(width * pango.SCALE)
+		layout.SetEllipsize(pango.EllipsizeEnd)
+	}
+	foreground := r.view.Color()
+	if hint != "" {
+		attrs := pango.NewAttrList()
+		setAttributeRange(attrs, pango.NewAttrForeground(
+			color16(float64(foreground.Red())), color16(float64(foreground.Green())), color16(float64(foreground.Blue())),
+		), len(shown), len(text))
+		setAttributeRange(attrs, pango.NewAttrForegroundAlpha(color16(float64(foreground.Alpha())*ghostHintAlpha)), len(shown), len(text))
+		layout.SetAttributes(attrs)
+	}
+	color := gdk.NewRGBA(foreground.Red(), foreground.Green(), foreground.Blue(), foreground.Alpha()*ghostAlpha)
+	if !r.canvas.SetGhost(layout, caret.X(), caret.Y(), &color) {
 		return false
 	}
-	r.place(caret.X(), caret.Y())
+	r.text = text
+	r.watchLayout()
 	return true
 }
 
-func (r *inlineCompletionRenderer) showPreview(suggestion string, cursor, lineEnd *gtk.TextIter) {
-	r.preview = true
-	r.composed = "↳ " + strings.TrimLeft(suggestion, "\r\n")
-
-	lineStart := cursor.Copy()
-	lineStart.SetLineOffset(0)
-	startRect := r.view.IterLocation(lineStart)
-	endRect := r.view.IterLocation(lineEnd)
-	visible := r.view.VisibleRect()
-	x := max(startRect.X(), visible.X()+r.view.LeftMargin())
-	r.width = max(1, visible.X()+visible.Width()-x-r.view.RightMargin())
-	_, height := r.layout().PixelSize()
-	height = max(endRect.Height(), height)
-	if !r.reserveSpace(cursor, lineEnd, height) {
-		r.view.SetBottomMargin(r.baseBottom + height)
-		r.extendedBottom = true
-	}
-	r.place(x, endRect.Y()+endRect.Height())
-}
-
-func (r *inlineCompletionRenderer) place(x, y int) {
+// watchLayout dismisses the suggestion when a resize or wrap change moves the
+// caret away from the drawn position.
+func (r *inlineCompletionRenderer) watchLayout() {
 	r.viewWidth, r.viewHeight = r.view.Width(), r.view.Height()
 	r.wrapMode = r.view.WrapMode()
-	_, height := r.layout().PixelSize()
-	r.area.SetContentWidth(r.width)
-	r.area.SetContentHeight(max(1, height))
-	r.view.MoveOverlay(r.area, x, y)
-	r.area.SetVisible(true)
-	r.area.QueueDraw()
 	r.tick = r.view.AddTickCallback(func(_ gtk.Widgetter, clock gdk.FrameClocker) bool {
 		r.tick = 0
 		// The first tick supplies a clock even if the view was not mapped when
-		// the suggestion arrived. Check after allocation, before GTK paints.
+		// the suggestion arrived.
 		r.frameClock = gdk.BaseFrameClock(clock)
 		r.layoutSignal = r.frameClock.ConnectAfter("layout", func() {
 			if r.layoutChanged() {
@@ -162,19 +126,15 @@ func (r *inlineCompletionRenderer) layoutChanged() bool {
 	return r.view.Width() != r.viewWidth || r.view.Height() != r.viewHeight || r.view.WrapMode() != r.wrapMode
 }
 
-func (r *inlineCompletionRenderer) reserveSpace(cursor, lineEnd *gtk.TextIter, pixels int) bool {
-	paragraphStart := cursor.Copy()
-	paragraphStart.SetLineOffset(0)
-	paragraphEnd := lineEnd.Copy()
-	paragraphEnd.ForwardChar()
-	if paragraphStart.Offset() == paragraphEnd.Offset() {
-		return false
+// caretColumn returns the caret's visual column for tab expansion.
+func (r *inlineCompletionRenderer) caretColumn(cursor *gtk.TextIter) int {
+	if cursor.LineOffset() > maxInlinePrefixRunes {
+		return 0
 	}
-	r.space.SetObjectProperty("pixels-below-lines", pixels)
-	r.buffer.ApplyTag(r.space, paragraphStart, paragraphEnd)
-	r.spaceStart = r.buffer.CreateMark("", paragraphStart, true)
-	r.spaceEnd = r.buffer.CreateMark("", paragraphEnd, false)
-	return true
+	lineStart := cursor.Copy()
+	lineStart.SetLineOffset(0)
+	prefix := r.view.Buffer().Text(lineStart, cursor, true)
+	return visualWidth(prefix, r.tabWidth())
 }
 
 func (r *inlineCompletionRenderer) hide() {
@@ -187,82 +147,69 @@ func (r *inlineCompletionRenderer) hide() {
 		r.frameClock = nil
 		r.layoutSignal = 0
 	}
-	wasVisible := r.area != nil && r.area.Visible()
-	if r.area != nil {
-		r.area.SetVisible(false)
-	}
-	if r.spaceStart != nil && r.spaceEnd != nil {
-		start := r.buffer.IterAtMark(r.spaceStart)
-		end := r.buffer.IterAtMark(r.spaceEnd)
-		r.buffer.RemoveTag(r.space, start, end)
-		r.buffer.DeleteMark(r.spaceStart)
-		r.buffer.DeleteMark(r.spaceEnd)
-		r.spaceStart, r.spaceEnd = nil, nil
-	}
-	if r.extendedBottom {
-		r.view.SetBottomMargin(r.baseBottom)
-		r.extendedBottom = false
-	}
-	r.composed = ""
-	r.preview = false
-	if wasVisible && r.redraw != nil {
-		// GtkTextView does not reliably invalidate the old pixels when a text
-		// overlay is hidden and moved again in the same frame.
-		r.redraw()
+	if r.text != "" {
+		r.canvas.ClearGhost()
+		r.text = ""
 	}
 }
 
-func (r *inlineCompletionRenderer) close() {
-	r.hide()
-	if r.area != nil {
-		r.area.SetDrawFunc(nil)
-		r.area = nil
+func (r *inlineCompletionRenderer) close() { r.hide() }
+
+// ghostDisplay returns the line drawn beside the caret and a hint for the
+// lines that are not drawn. A suggestion that starts with a line break shows
+// its first new line after a return arrow.
+func ghostDisplay(suggestion string) (shown, hint string) {
+	lines := strings.Split(strings.ReplaceAll(suggestion, "\r\n", "\n"), "\n")
+	for index := range lines {
+		lines[index] = strings.TrimSuffix(lines[index], "\r")
 	}
+	shown, rest := lines[0], lines[1:]
+	if shown == "" && len(rest) > 0 {
+		shown, rest = "↵ "+rest[0], rest[1:]
+	}
+	switch len(rest) {
+	case 0:
+	case 1:
+		hint = "  +1 line"
+	default:
+		hint = fmt.Sprintf("  +%d lines", len(rest))
+	}
+	return shown, hint
 }
 
-func (r *inlineCompletionRenderer) layout() *pango.Layout {
-	layout := r.area.CreatePangoLayout(r.composed)
-	if tabs := r.view.Tabs(); tabs != nil {
-		layout.SetTabs(tabs)
+// expandTabs replaces tabs with spaces up to the next tab stop, counting from
+// the caret's visual column.
+func expandTabs(text string, column, tabWidth int) string {
+	if tabWidth <= 0 {
+		tabWidth = 8
 	}
-	if r.preview {
-		layout.SetWidth(r.width * pango.SCALE)
-		layout.SetWrap(pango.WrapWordChar)
-	} else {
-		layout.SetWidth(-1)
+	var out strings.Builder
+	for _, r := range text {
+		if r == '\t' {
+			spaces := tabWidth - column%tabWidth
+			out.WriteString(strings.Repeat(" ", spaces))
+			column += spaces
+			continue
+		}
+		out.WriteRune(r)
+		column++
 	}
-
-	attrs := pango.NewAttrList()
-	accent := widgetColor(&r.area.Widget, "accent_color", rgbaColor{0.21, 0.52, 0.89, 1})
-	ghost := pango.NewAttrForeground(color16(accent.red), color16(accent.green), color16(accent.blue))
-	setAttributeRange(attrs, ghost, 0, len(r.composed))
-	ghostOpacity := pango.NewAttrForegroundAlpha(color16(ghostAlpha))
-	setAttributeRange(attrs, ghostOpacity, 0, len(r.composed))
-	for _, span := range standaloneESpans(r.composed) {
-		color := pango.NewAttrForeground(color16(accent.red), color16(accent.green), color16(accent.blue))
-		setAttributeRange(attrs, color, span.byteStart, span.byteEnd)
-		style := pango.NewAttrStyle(pango.StyleItalic)
-		setAttributeRange(attrs, style, span.byteStart, span.byteEnd)
-	}
-	layout.SetAttributes(attrs)
-	return layout
+	return out.String()
 }
 
-func (r *inlineCompletionRenderer) draw(_ *gtk.DrawingArea, cr *cairo.Context, width, height int) {
-	// Never paint stale geometry, including before a newly mapped view has
-	// installed its layout callback.
-	if r.layoutChanged() {
-		return
+func visualWidth(text string, tabWidth int) int {
+	if tabWidth <= 0 {
+		tabWidth = 8
 	}
-	// Glyph overhangs must stay inside the suggestion's own drawing area.
-	cr.Save()
-	defer cr.Restore()
-	cr.Rectangle(0, 0, float64(width), float64(height))
-	cr.Clip()
-	foreground := widgetColor(&r.area.Widget, "view_fg_color", rgbaColor{0.12, 0.12, 0.12, 1})
-	cr.SetSourceRGBA(foreground.red, foreground.green, foreground.blue, foreground.alpha)
-	cr.MoveTo(0, 0)
-	pangocairo.ShowLayout(cr, r.layout())
+	column := 0
+	for _, r := range text {
+		if r == '\t' {
+			column += tabWidth - column%tabWidth
+		} else {
+			column++
+		}
+	}
+	return column
 }
 
 func inlineCompletionText(text string) string {
@@ -280,21 +227,6 @@ func setAttributeRange(attributes *pango.AttrList, attribute *pango.Attribute, s
 	attribute.SetStartIndex(uint(start))
 	attribute.SetEndIndex(uint(end))
 	attributes.Insert(attribute)
-}
-
-type rgbaColor struct{ red, green, blue, alpha float64 }
-
-func widgetColor(widget *gtk.Widget, name string, fallback rgbaColor) rgbaColor {
-	// GTK4 has no replacement for resolving named theme colors.
-	//nolint:staticcheck
-	color, ok := widget.StyleContext().LookupColor(name)
-	if !ok || color == nil {
-		return fallback
-	}
-	return rgbaColor{
-		red: float64(color.Red()), green: float64(color.Green()),
-		blue: float64(color.Blue()), alpha: float64(color.Alpha()),
-	}
 }
 
 func color16(value float64) uint16 { return uint16(max(0, min(1, value)) * 65535) }

@@ -45,11 +45,82 @@ static gboolean ensure_source(void) {
   return TRUE;
 }
 
+typedef GType (*get_type_fn)(void);
+
+// Ghost text is drawn by a GtkSourceView subclass in the ABOVE_TEXT layer, so
+// GTK renders it as a text node in the same pass and coordinates as the
+// document. It never changes the text layout.
+typedef struct {
+  PangoLayout *layout;
+  int x, y;
+  GdkRGBA color;
+} GhostText;
+
+static GType ghost_view_type;
+static GQuark ghost_quark;
+static void (*parent_snapshot_layer)(GtkTextView *, GtkTextViewLayer, GtkSnapshot *);
+
+static void ghost_free(gpointer data) {
+  GhostText *ghost = data;
+  g_clear_object(&ghost->layout);
+  g_free(ghost);
+}
+
+static void ghost_snapshot_layer(GtkTextView *view, GtkTextViewLayer layer, GtkSnapshot *snapshot) {
+  if (parent_snapshot_layer) parent_snapshot_layer(view, layer, snapshot);
+  if (layer != GTK_TEXT_VIEW_LAYER_ABOVE_TEXT) return;
+  GhostText *ghost = g_object_get_qdata(G_OBJECT(view), ghost_quark);
+  if (!ghost || !ghost->layout) return;
+  gtk_snapshot_save(snapshot);
+  gtk_snapshot_translate(snapshot, &GRAPHENE_POINT_INIT(ghost->x, ghost->y));
+  gtk_snapshot_append_layout(snapshot, ghost->layout, &ghost->color);
+  gtk_snapshot_restore(snapshot);
+}
+
+static void ghost_class_init(gpointer klass, gpointer data) {
+  GtkTextViewClass *view_class = GTK_TEXT_VIEW_CLASS(klass);
+  parent_snapshot_layer = view_class->snapshot_layer;
+  view_class->snapshot_layer = ghost_snapshot_layer;
+}
+
+static GType ghost_view_get_type(void) {
+  if (ghost_view_type) return ghost_view_type;
+  get_type_fn parent_type = (get_type_fn)sym(source_lib, "gtk_source_view_get_type");
+  if (!parent_type) return 0;
+  GTypeQuery query;
+  g_type_query(parent_type(), &query);
+  if (!query.type) return 0;
+  ghost_quark = g_quark_from_static_string("e-ghost-text");
+  ghost_view_type = g_type_register_static_simple(parent_type(), "EGhostSourceView",
+                                                  query.class_size, ghost_class_init,
+                                                  query.instance_size, NULL, 0);
+  return ghost_view_type;
+}
+
 static GtkWidget *bridge_source_view_new(void) {
   if (!ensure_source()) return NULL;
+  GType type = ghost_view_get_type();
+  if (type) return g_object_new(type, NULL);
   source_view_new_fn make = (source_view_new_fn)sym(source_lib, "gtk_source_view_new");
   if (!make) return NULL;
   return make();
+}
+
+static gboolean bridge_set_ghost(GtkTextView *view, PangoLayout *layout, int x, int y,
+                                 float red, float green, float blue, float alpha) {
+  if (!ghost_view_type || !G_TYPE_CHECK_INSTANCE_TYPE(view, ghost_view_type)) return FALSE;
+  GhostText *ghost = NULL;
+  if (layout) {
+    ghost = g_new0(GhostText, 1);
+    ghost->layout = g_object_ref(layout);
+    ghost->x = x;
+    ghost->y = y;
+    ghost->color = (GdkRGBA){red, green, blue, alpha};
+  }
+  // Replacing the qdata frees the previous layout.
+  g_object_set_qdata_full(G_OBJECT(view), ghost_quark, ghost, ghost ? ghost_free : NULL);
+  gtk_widget_queue_draw(GTK_WIDGET(view));
+  return TRUE;
 }
 
 static const char *bridge_last_error(void) {
@@ -135,6 +206,10 @@ static void bridge_unref(void *object) {
 static GtkTextView *bridge_text_view(uintptr_t pointer) {
   return (GtkTextView *)pointer;
 }
+
+static PangoLayout *bridge_layout(uintptr_t pointer) {
+  return (PangoLayout *)pointer;
+}
 */
 import "C"
 
@@ -144,7 +219,9 @@ import (
 	"unsafe"
 
 	"github.com/diamondburned/gotk4/pkg/core/glib"
+	"github.com/diamondburned/gotk4/pkg/gdk/v4"
 	"github.com/diamondburned/gotk4/pkg/gtk/v4"
+	"github.com/diamondburned/gotk4/pkg/pango"
 )
 
 // View is a GtkSourceView exposed through its GtkTextView base wrapper.
@@ -204,6 +281,22 @@ func (v *View) EnableSpelling(enabled bool) bool {
 	}
 	C.bridge_set_spelling((*C.SpellingTextBufferAdapter)(v.spellAdapter), boolValue(enabled))
 	return true
+}
+
+// SetGhost draws layout above the document text at buffer coordinates x, y.
+// It reports false when the view cannot draw ghost text.
+func (v *View) SetGhost(layout *pango.Layout, x, y int, color *gdk.RGBA) bool {
+	ok := C.bridge_set_ghost(v.native(), C.bridge_layout(C.uintptr_t(glib.BaseObject(layout).Native())),
+		C.int(x), C.int(y), C.float(color.Red()), C.float(color.Green()), C.float(color.Blue()), C.float(color.Alpha())) != 0
+	runtime.KeepAlive(v)
+	runtime.KeepAlive(layout)
+	return ok
+}
+
+// ClearGhost removes ghost text drawn by SetGhost.
+func (v *View) ClearGhost() {
+	C.bridge_set_ghost(v.native(), nil, 0, 0, 0, 0, 0, 0)
+	runtime.KeepAlive(v)
 }
 
 // Close releases native helper objects owned by this wrapper.

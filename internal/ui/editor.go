@@ -91,6 +91,7 @@ type editorDocument struct {
 	multiTag            *gtk.TextTag
 	carets              []*gtk.Label
 	brandTag            *gtk.TextTag
+	brandStyleSignals   []glib.SignalHandle
 	brandScanGen        uint64
 	brandRefreshPending bool
 	brandRefreshStart   int
@@ -183,7 +184,7 @@ func (d *editorDocument) configureView() {
 	d.buffer.SetEnableUndo(true)
 	d.view.EnableSpelling(cfg.SpellCheck)
 
-	d.ghost = newInlineCompletionRenderer(d.view.Widget, d.buffer, d.dismissCompletion)
+	d.ghost = newInlineCompletionRenderer(d.view.Widget, d.view, d.tabWidth, d.dismissCompletion)
 	d.configureBranding()
 
 	d.multiTag = gtk.NewTextTag("e-multiple-selection")
@@ -679,6 +680,15 @@ func (d *editorDocument) requestCompletion(manual bool) {
 		operation.Cancel()
 		return
 	}
+	// Suggestions are drawn only beside the caret at a line end.
+	if !cursor.EndsLine() {
+		if manual {
+			operation.Fail(fmt.Errorf("move the caret to the end of a line"))
+		} else {
+			operation.Cancel()
+		}
+		return
+	}
 	maxPrefix := d.window.options.Config.AI.PrefixSize
 	maxSuffix := d.window.options.Config.AI.SuffixSize
 	start := d.buffer.IterAtOffset(max(0, offset-maxPrefix))
@@ -749,11 +759,7 @@ func (d *editorDocument) showCompletionEdit(display, insertion string, offset, r
 	d.ghostText, d.ghostOffset = display, offset
 	d.completionText = insertion
 	d.replaceStart, d.replaceEnd = replaceStart, replaceEnd
-	presentation := "inline"
-	if d.ghost.preview {
-		presentation = "below-line"
-	}
-	logging.Trace("ui: completion visible", "presentation", presentation, "offset", offset)
+	logging.Trace("ui: completion visible", "offset", offset)
 }
 
 func (d *editorDocument) dismissCompletion() {
@@ -793,6 +799,15 @@ func (d *editorDocument) acceptCompletion(oneWord bool) {
 	}
 	d.buffer.Insert(d.buffer.IterAtOffset(start), text)
 	d.buffer.EndUserAction()
+	// Style accepted text now so it does not change color a frame later.
+	d.applyBrandRange(start-1, start+utf8.RuneCountInString(text)+1)
+}
+
+func (d *editorDocument) tabWidth() int {
+	if d.props.TabWidth > 0 {
+		return d.props.TabWidth
+	}
+	return d.window.options.Config.Editor.TabWidth
 }
 
 func completionWord(text string) string {
@@ -907,6 +922,10 @@ func (d *editorDocument) requestLSPCompletion() {
 		item := items[0]
 		dispatch.Main(func() {
 			if d.closed || d.buffer.IterAtMark(d.buffer.GetInsert()).Offset() != offset {
+				return
+			}
+			if !d.buffer.IterAtOffset(offset).EndsLine() {
+				d.window.toast("Completions show only at the end of a line")
 				return
 			}
 			display, insertion := item.InsertText, item.InsertText
@@ -1059,6 +1078,7 @@ func (d *editorDocument) close() {
 		d.previewTimer.Stop()
 	}
 	d.stopLSP()
+	d.closeBranding()
 	if d.ghost != nil {
 		d.ghost.close()
 	}

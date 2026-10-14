@@ -13,11 +13,13 @@ editing, EditorConfig support, and availability-aware AI autocomplete.
 - `cmd/e` is the thin Cobra entry point and application wiring.
 - `internal/ui` owns GTK and libadwaita widgets. GTK is single-threaded; slow
   file, process, and network operations run outside the main loop. Inline AI
-  text uses a Pango overlay: beside the caret at a real line end, or in reserved
-  space below the paragraph otherwise. It never masks, redraws, restyles, or
-  enters document text.
+  text appears only at a real line end: one line beside the caret, plus a
+  `+N lines` hint. The source view draws it in its own `ABOVE_TEXT` layer. It
+  never changes document layout, restyles document text, or enters the buffer.
 - `internal/source` is the small dynamic cgo bridge to GtkSourceView 5 and
-  libspelling. It wraps objects as their GTK base types for gotk4.
+  libspelling. It wraps objects as their GTK base types for gotk4, and
+  subclasses the source view to draw ghost text.
+- `internal/gtktest` renders live widgets to pixels for `make test-ui`.
 - `internal/document` owns file metadata, atomic saves, session recovery, and
   bounded context extraction. The GTK buffer remains the only live full copy.
 - `internal/ai` owns OpenAI-compatible completion providers, ordered failover,

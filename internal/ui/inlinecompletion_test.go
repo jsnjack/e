@@ -55,3 +55,44 @@ func TestStandaloneESpans(t *testing.T) {
 		})
 	}
 }
+
+func TestGhostDisplay(t *testing.T) {
+	tests := []struct {
+		name, suggestion, shown, hint string
+	}{
+		{"single line", " ghost", " ghost", ""},
+		{"two lines", " ghost\nnext", " ghost", "  +1 line"},
+		{"crlf lines", "a\r\nb\r\nc", "a", "  +2 lines"},
+		{"leading break", "\nnext", "↵ next", ""},
+		{"leading break and more", "\nnext\nmore", "↵ next", "  +1 line"},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			shown, hint := ghostDisplay(test.suggestion)
+			if shown != test.shown || hint != test.hint {
+				t.Fatalf("ghostDisplay(%q) = %q, %q, want %q, %q", test.suggestion, shown, hint, test.shown, test.hint)
+			}
+		})
+	}
+}
+
+func TestExpandTabs(t *testing.T) {
+	tests := []struct {
+		text          string
+		column, width int
+		want          string
+	}{
+		{"\tx", 0, 4, "    x"},
+		{"\tx", 1, 4, "   x"},
+		{"a\tb", 2, 4, "a b"},
+		{"\t", 0, 0, "        "},
+	}
+	for _, test := range tests {
+		if got := expandTabs(test.text, test.column, test.width); got != test.want {
+			t.Fatalf("expandTabs(%q, %d, %d) = %q, want %q", test.text, test.column, test.width, got, test.want)
+		}
+	}
+	if got := visualWidth("a\tbc", 4); got != 6 {
+		t.Fatalf("visualWidth = %d, want 6", got)
+	}
+}

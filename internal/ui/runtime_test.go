@@ -11,7 +11,6 @@ import (
 	"time"
 
 	"github.com/diamondburned/gotk4-adwaita/pkg/adw"
-	"github.com/diamondburned/gotk4/pkg/cairo"
 	"github.com/diamondburned/gotk4/pkg/gdk/v4"
 	"github.com/diamondburned/gotk4/pkg/gio/v2"
 	"github.com/diamondburned/gotk4/pkg/glib/v2"
@@ -19,6 +18,7 @@ import (
 	"github.com/jsnjack/e/internal/activity"
 	"github.com/jsnjack/e/internal/ai"
 	"github.com/jsnjack/e/internal/config"
+	"github.com/jsnjack/e/internal/gtktest"
 	"github.com/jsnjack/e/internal/lsp"
 )
 
@@ -237,40 +237,30 @@ func TestEditorRuntimeSmoke(t *testing.T) {
 	doc.buffer.PlaceCursor(doc.buffer.IterAtOffset(5))
 	doc.showCompletion(" ghost", 5)
 	if got := bufferText(doc.buffer); got != "left right" {
-		t.Fatalf("injected completion changed document buffer to %q", got)
+		t.Fatalf("mid-line completion changed document buffer to %q", got)
 	}
-	if !doc.ghost.area.Visible() || doc.ghost.spaceStart == nil || doc.ghostText != " ghost" {
-		t.Fatal("mid-line completion was not shown in reserved space")
+	if doc.ghost.visible() || doc.ghostText != "" {
+		t.Fatal("mid-line completion was shown")
 	}
 
-	redraws := 0
-	redraw := doc.ghost.redraw
-	doc.ghost.redraw = func() {
-		redraws++
-		redraw()
-	}
 	doc.buffer.PlaceCursor(doc.buffer.EndIter())
 	doc.showCompletion(" ghost\nnext", doc.buffer.CharCount())
-	doc.ghost.redraw = redraw
 	if got := bufferText(doc.buffer); got != "left right" {
 		t.Fatalf("line-end completion changed document buffer to %q", got)
 	}
-	if redraws == 0 {
-		t.Fatal("moving a completion did not invalidate its previous pixels")
-	}
-	if !doc.ghost.area.Visible() || doc.ghost.spaceStart == nil || doc.ghostText != " ghost\nnext" {
-		t.Fatalf("safe completion was not rendered exactly: text=%q visible=%v", doc.ghostText, doc.ghost.area.Visible())
+	if doc.ghostText != " ghost\nnext" || doc.ghost.text != " ghost  +1 line" {
+		t.Fatalf("multiline completion shown as %q for %q", doc.ghost.text, doc.ghostText)
 	}
 
 	doc.buffer.PlaceCursor(doc.buffer.StartIter())
-	if doc.ghost.area.Visible() || doc.ghostText != "" || doc.ghost.spaceStart != nil {
+	if doc.ghost.visible() || doc.ghostText != "" {
 		t.Fatal("moving the caret did not dismiss the inline completion")
 	}
 	doc.buffer.PlaceCursor(doc.buffer.EndIter())
 	doc.showCompletion(" ghost", doc.buffer.CharCount())
 	doc.dismissCompletion()
-	if doc.ghost.area.Visible() || doc.ghost.spaceStart != nil || bufferText(doc.buffer) != "left right" {
-		t.Fatal("dismissing injected completion did not restore a clean view")
+	if doc.ghost.visible() || bufferText(doc.buffer) != "left right" {
+		t.Fatal("dismissing a completion did not restore a clean view")
 	}
 
 	setBufferText(doc, "typed")
@@ -280,7 +270,7 @@ func TestEditorRuntimeSmoke(t *testing.T) {
 	if got := bufferText(doc.buffer); got != "typed!" {
 		t.Fatalf("typing with a completion visible changed real text to %q", got)
 	}
-	if doc.ghost.area.Visible() || doc.ghostText != "" {
+	if doc.ghost.visible() || doc.ghostText != "" {
 		t.Fatal("typing did not immediately remove the ghost completion")
 	}
 
@@ -290,8 +280,8 @@ func TestEditorRuntimeSmoke(t *testing.T) {
 		t.Fatal("Alt+backslash did not trigger manual completion")
 	}
 	waitForUI(t, func() bool { return w.activity.serving.Text() == "runtime" })
-	if doc.ghostText != "completion" || !doc.ghost.area.Visible() {
-		t.Fatalf("generated completion was not visible: text=%q visible=%v", doc.ghostText, doc.ghost.area.Visible())
+	if doc.ghostText != "completion" || !doc.ghost.visible() {
+		t.Fatalf("generated completion was not visible: text=%q visible=%v", doc.ghostText, doc.ghost.visible())
 	}
 	if len(w.activity.history) == 0 || w.activity.model.Text() != "AI: runtime" ||
 		w.activity.label.Text() != "Suggestion ready" {
@@ -472,47 +462,59 @@ func setBufferText(doc *editorDocument, text string) {
 	doc.loading = false
 }
 
+// checkCompletionDoesNotRedrawText renders the real view with and without a
+// suggestion. Only pixels right of the caret on the caret's line may change.
 func checkCompletionDoesNotRedrawText(t *testing.T, doc *editorDocument) {
 	t.Helper()
-	setBufferText(doc, "Font rendering is a very")
-	doc.buffer.PlaceCursor(doc.buffer.EndIter())
-	doc.showCompletion(" useful test", doc.buffer.CharCount())
-	waitForUI(t, func() bool { return doc.ghost.area.Width() > 0 })
-	if !doc.ghost.area.Visible() || doc.ghost.preview {
+	view := doc.view.Widget
+	view.SetCursorVisible(false)
+	defer view.SetCursorVisible(true)
+	setBufferText(doc, "Font rendering is a very\nsecond line stays put")
+	cursor := doc.buffer.IterAtOffset(len("Font rendering is a very"))
+	doc.buffer.PlaceCursor(cursor)
+	waitForUI(t, func() bool { return view.Width() > 0 })
+	before, stride := renderView(t, view)
+	doc.showCompletion(" useful test", cursor.Offset())
+	if !doc.ghost.visible() {
 		t.Fatal("pixel regression requires a visible inline completion")
 	}
-	bounds, ok := doc.ghost.area.ComputeBounds(doc.view.Widget)
-	if !ok {
-		t.Fatal("cannot locate the completion overlay")
-	}
-	cursor, _ := doc.view.Widget.CursorLocations(doc.buffer.EndIter())
-	caretX, _ := doc.view.Widget.BufferToWindowCoords(gtk.TextWindowWidget, cursor.X(), cursor.Y())
-	width, height := doc.view.Widget.Width(), doc.view.Widget.Height()
-	surface := cairo.CreateImageSurface(cairo.FormatARGB32, width, height)
-	defer surface.Close()
-	cr := cairo.Create(surface)
-	defer cr.Close()
-	cr.Translate(float64(bounds.X()), float64(bounds.Y()))
-	doc.ghost.draw(doc.ghost.area, cr, doc.ghost.area.Width(), doc.ghost.area.Height())
-	surface.Flush()
-	pixels, stride := surface.Data(), surface.Stride()
-	ink := false
-	for y := 0; y < height; y++ {
-		for x := 0; x < width; x++ {
-			pixel := pixels[y*stride+x*4 : y*stride+x*4+4]
-			if pixel[0]|pixel[1]|pixel[2]|pixel[3] == 0 {
-				continue
-			}
-			if x < caretX {
-				t.Fatalf("suggestion painted over document text at (%d, %d), before caret x=%d", x, y, caretX)
-			}
-			ink = true
+	after, _ := renderView(t, view)
+	caret, _ := view.CursorLocations(cursor)
+	caretX, caretY := view.BufferToWindowCoords(gtk.TextWindowWidget, caret.X(), caret.Y())
+	changed := false
+	for index := range before {
+		if before[index] == after[index] {
+			continue
 		}
+		x, y := (index%stride)/4, index/stride
+		if x < caretX || y < caretY || y >= caretY+caret.Height() {
+			t.Fatalf("suggestion changed pixel (%d, %d) outside caret line right of x=%d", x, y, caretX)
+		}
+		changed = true
 	}
-	if !ink {
+	if !changed {
 		t.Fatal("suggestion did not paint any pixels")
 	}
 	doc.dismissCompletion()
+	if cleared, _ := renderView(t, view); !bytes.Equal(before, cleared) {
+		t.Fatal("dismissing the suggestion left pixels behind")
+	}
+}
+
+func renderView(t *testing.T, widget *gtk.TextView) ([]byte, int) {
+	t.Helper()
+	// Let pending text changes allocate before snapshotting.
+	frames := 0
+	widget.AddTickCallback(func(gtk.Widgetter, gdk.FrameClocker) bool {
+		frames++
+		return frames < 2
+	})
+	waitForUI(t, func() bool { return frames >= 2 })
+	pixels, stride, err := gtktest.Render(widget)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return pixels, stride
 }
 
 func checkCompletionLineEnds(t *testing.T, doc *editorDocument) {
@@ -521,20 +523,22 @@ func checkCompletionLineEnds(t *testing.T, doc *editorDocument) {
 		setBufferText(doc, "first\n\nsecond")
 		doc.buffer.PlaceCursor(doc.buffer.IterAtOffset(offset))
 		doc.showCompletion(" suggestion", offset)
-		if doc.ghost.preview || !doc.ghost.area.Visible() {
-			t.Fatalf("line-end completion at %d was not inline", offset)
+		if !doc.ghost.visible() {
+			t.Fatalf("line-end completion at %d was not shown", offset)
 		}
 		doc.dismissCompletion()
 	}
 	doc.buffer.PlaceCursor(doc.buffer.IterAtOffset(5))
-	doc.showCompletion("\nnext", 5)
-	if !doc.ghost.preview || doc.ghost.spaceEnd == nil || doc.buffer.IterAtMark(doc.ghost.spaceEnd).Offset() != 6 {
-		t.Fatal("multiline completion reserved space outside the current paragraph")
-	}
-	if doc.buffer.IterAtOffset(6).HasTag(doc.ghost.space) || bufferText(doc.buffer) != "first\n\nsecond" {
-		t.Fatal("completion changed the next paragraph or document text")
+	doc.showCompletion("\nnext\nmore\nlast", 5)
+	if doc.ghost.text != "↵ next  +2 lines" || bufferText(doc.buffer) != "first\n\nsecond" {
+		t.Fatalf("leading line break shown as %q", doc.ghost.text)
 	}
 	doc.dismissCompletion()
+	doc.buffer.PlaceCursor(doc.buffer.IterAtOffset(2))
+	doc.showCompletion("st", 2)
+	if doc.ghost.visible() {
+		t.Fatal("mid-line completion was shown")
+	}
 }
 
 func checkCompletionLongLine(t *testing.T, doc *editorDocument) {
@@ -546,15 +550,12 @@ func checkCompletionLongLine(t *testing.T, doc *editorDocument) {
 	doc.buffer.PlaceCursor(doc.buffer.EndIter())
 	doc.view.Widget.ScrollToMark(doc.buffer.GetInsert(), 0, false, 0, 0)
 	doc.showCompletion(" suggestion", doc.buffer.CharCount())
-	if !doc.ghost.preview || doc.ghost.composed != "↳  suggestion" {
-		t.Fatal("long unwrapped line copied its prefix into the completion layout")
-	}
-	if doc.ghost.width > doc.view.Widget.VisibleRect().Width() {
-		t.Fatal("long-line preview exceeded the viewport width")
+	if doc.ghost.text != " suggestion" {
+		t.Fatalf("long unwrapped line shown as %q", doc.ghost.text)
 	}
 	doc.acceptCompletion(false)
 	if bufferText(doc.buffer) != text+" suggestion" {
-		t.Fatal("long-line preview did not accept the original suggestion")
+		t.Fatal("long-line completion did not accept the original suggestion")
 	}
 	doc.view.Widget.SetWrapMode(wrap)
 }
@@ -567,13 +568,17 @@ func checkCompletionResize(t *testing.T, doc *editorDocument) {
 	doc.view.Widget.SetWrapMode(gtk.WrapWordChar)
 	text := strings.Repeat("wrapped paragraph ", 40) + "\nnext paragraph"
 	setBufferText(doc, text)
-	doc.buffer.PlaceCursor(doc.buffer.IterAtOffset(5))
-	doc.showCompletion(" suggestion\nnext", 5)
+	lineEnd := strings.Index(text, "\n")
+	doc.buffer.PlaceCursor(doc.buffer.IterAtOffset(lineEnd))
+	doc.showCompletion(" suggestion\nnext", lineEnd)
+	if !doc.ghost.visible() {
+		t.Fatal("wrapped paragraph completion was not shown")
+	}
 	viewWidth := doc.view.Widget.Width()
 	win.SetSizeRequest(width+200, height)
-	waitForUI(t, func() bool { return doc.view.Widget.Width() != viewWidth && !doc.ghost.area.Visible() })
-	if doc.ghostText != "" || doc.completionText != "" || doc.ghost.spaceStart != nil || doc.ghost.tick != 0 {
-		t.Fatal("resizing left a completion or reserved space behind")
+	waitForUI(t, func() bool { return doc.view.Widget.Width() != viewWidth && !doc.ghost.visible() })
+	if doc.ghostText != "" || doc.completionText != "" || doc.ghost.tick != 0 {
+		t.Fatal("resizing left a completion behind")
 	}
 	if doc.keyPressed(gdk.KEY_Tab, 0, 0) || bufferText(doc.buffer) != text {
 		t.Fatal("Tab accepted an invisible completion after resizing")

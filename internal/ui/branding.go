@@ -4,6 +4,7 @@ import (
 	"fmt"
 
 	"github.com/diamondburned/gotk4-adwaita/pkg/adw"
+	coreglib "github.com/diamondburned/gotk4/pkg/core/glib"
 	"github.com/diamondburned/gotk4/pkg/glib/v2"
 	"github.com/diamondburned/gotk4/pkg/gtk/v4"
 	"github.com/diamondburned/gotk4/pkg/pango"
@@ -13,13 +14,31 @@ const brandScanChunk = 32 * 1024
 
 func (d *editorDocument) configureBranding() {
 	d.brandTag = gtk.NewTextTag("e-brand")
+	d.brandTag.SetObjectProperty("style", pango.StyleItalic)
+	d.updateBrandColor()
+	d.buffer.TagTable().Add(d.brandTag)
+	// Follow accent and dark-mode changes instead of keeping the startup color.
+	style := adw.StyleManagerGetDefault()
+	d.brandStyleSignals = []coreglib.SignalHandle{
+		style.NotifyProperty("accent-color", d.updateBrandColor),
+		style.NotifyProperty("dark", d.updateBrandColor),
+	}
+}
+
+func (d *editorDocument) updateBrandColor() {
 	style := adw.StyleManagerGetDefault()
 	accent := adw.AccentColorToStandaloneRGBA(style.AccentColor(), style.Dark())
 	d.brandTag.SetObjectProperty("foreground", fmt.Sprintf(
 		"#%02x%02x%02x", color8(float64(accent.Red())), color8(float64(accent.Green())), color8(float64(accent.Blue())),
 	))
-	d.brandTag.SetObjectProperty("style", pango.StyleItalic)
-	d.buffer.TagTable().Add(d.brandTag)
+}
+
+func (d *editorDocument) closeBranding() {
+	style := adw.StyleManagerGetDefault()
+	for _, handle := range d.brandStyleSignals {
+		style.HandlerDisconnect(handle)
+	}
+	d.brandStyleSignals = nil
 }
 
 func color8(value float64) uint8 { return uint8(max(0, min(1, value))*255 + 0.5) }
