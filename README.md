@@ -16,15 +16,19 @@ while adding inline AI and language-server completion.
   Lemonade serving Gemma.
 - LSP completion and diagnostics when a matching language server is installed.
 - Spell checking through libspelling and VS Code-style multiple cursors.
-- A collapsible, lazily scanned file tree when E is launched with a directory.
-- Fuzzy Command Palette and asynchronous project Quick Open.
+- A collapsible, lazily scanned file tree. Without an open folder, `Ctrl+B`
+  uses the active file's Git root or folder.
+- Fuzzy Command Palette and asynchronous project Quick Open, which follows
+  `.gitignore` inside Git repositories.
+- Unmodified files reload when they change on disk. Unsaved text is written
+  to the session every few seconds, so a crash keeps it.
 - Live, side-by-side GitHub-flavored Markdown preview through WebKitGTK 6.
 
 Automatic AI suggestions while typing are disabled by default and require an
 explicit, persisted consent in Preferences. A manual `Alt+\` request works
-independently and is itself an explicit, one-shot request. The default
-autocomplete order is `local-qwen` at a remote endpoint followed by
-`Gemma-4-E4B-it-GGUF` at Lemonade on `localhost:13305`. On first launch, E imports
+independently and is itself an explicit, one-shot request. The default model
+is `Gemma-4-E4B-it-GGUF` at Lemonade on `localhost:13305`; add remote models in
+Preferences. On first launch, E imports
 the ordered AI chain from Mailbox when available. Requests contain bounded text
 around the caret and the file's base name, never its full path. Credentials are
 read from the system keyring, first under `e-ai` and then under `mailbox-ai`; they
@@ -42,7 +46,9 @@ make build
 
 Run `./e [FILE_OR_DIRECTORY...]` from the repository. `make check` runs the
 portable quality gate. `make test-ui` runs the GTK interaction and native
-Markdown-preview smoke tests from a graphical desktop session. Installation
+Markdown-preview smoke tests in a private headless Weston session, so no
+windows appear (`sudo dnf install weston`; set `E_TEST_VISIBLE=1` to watch
+them on the desktop instead). Installation
 targets `/usr/local` by default:
 
 ```sh
@@ -69,8 +75,11 @@ Common shortcuts:
 | `Ctrl+Space` | Request an LSP suggestion |
 | `Ctrl+D` | Add the next matching occurrence |
 | `Ctrl+Shift+L` | Select all matching occurrences |
+| `Ctrl+Shift+Up/Down` or `Shift+Alt+Up/Down` | Add a cursor above or below |
 | `Alt+Click` | Add or remove a cursor |
-| `Shift+Alt+Up/Down` | Add a cursor above or below |
+| `Shift+Alt+Drag` | Column selection, one cursor per line |
+| `Ctrl+U` | Remove the last added cursor |
+| `Escape` | Return to one cursor |
 | `Ctrl+B` | Show or hide the project sidebar |
 | `Ctrl+Shift+E` | Show the project sidebar |
 | `Ctrl+Shift+P` / `Ctrl+P` | Command Palette / Quick Open |

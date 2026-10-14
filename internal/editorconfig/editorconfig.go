@@ -50,11 +50,15 @@ func Resolve(filename string) (Properties, error) {
 			break
 		}
 	}
-	var out Properties
+	var state resolveState
 	for i := len(files) - 1; i >= 0; i-- {
-		if err := applyFile(files[i], abs, &out); err != nil {
+		if err := applyFile(files[i], abs, &state); err != nil {
 			return Properties{}, err
 		}
+	}
+	out := state.props
+	if state.indentSizeTab {
+		out.IndentSize = out.TabWidth
 	}
 	if out.IndentSize == 0 {
 		out.IndentSize = out.TabWidth
@@ -63,6 +67,13 @@ func Resolve(filename string) (Properties, error) {
 		out.TabWidth = out.IndentSize
 	}
 	return out, nil
+}
+
+// resolveState collects properties across sections and files. indent_size =
+// tab is kept as a flag so it uses the final tab_width, not the one seen so far.
+type resolveState struct {
+	props         Properties
+	indentSizeTab bool
 }
 
 func hasRoot(path string) (bool, error) {
@@ -92,7 +103,7 @@ func hasRoot(path string) (bool, error) {
 	return false, nil
 }
 
-func applyFile(path, filename string, out *Properties) error {
+func applyFile(path, filename string, out *resolveState) error {
 	file, err := os.Open(path)
 	if err != nil {
 		return fmt.Errorf("open %s: %w", path, err)
@@ -132,34 +143,6 @@ func applyFile(path, filename string, out *Properties) error {
 	return nil
 }
 
-func matches(pattern, rel string) bool {
-	pattern = filepath.ToSlash(pattern)
-	if !strings.Contains(pattern, "/") {
-		rel = filepath.Base(rel)
-	}
-	pattern = strings.TrimPrefix(pattern, "/")
-	for _, expanded := range expandBraces(pattern) {
-		matched, err := filepath.Match(filepath.FromSlash(expanded), filepath.FromSlash(rel))
-		if err == nil && matched {
-			return true
-		}
-	}
-	return false
-}
-
-func expandBraces(pattern string) []string {
-	start := strings.IndexByte(pattern, '{')
-	end := strings.IndexByte(pattern, '}')
-	if start < 0 || end < start {
-		return []string{pattern}
-	}
-	var out []string
-	for _, choice := range strings.Split(pattern[start+1:end], ",") {
-		out = append(out, pattern[:start]+choice+pattern[end+1:])
-	}
-	return out
-}
-
 func splitProperty(line string) (string, string, bool) {
 	idx := strings.IndexAny(line, "=:")
 	if idx < 1 {
@@ -168,8 +151,12 @@ func splitProperty(line string) (string, string, bool) {
 	return strings.TrimSpace(line[:idx]), strings.TrimSpace(line[idx+1:]), true
 }
 
-func applyProperty(out *Properties, key, value string) {
+func applyProperty(state *resolveState, key, value string) {
+	out := &state.props
 	if value == "unset" {
+		if key == "indent_size" {
+			state.indentSizeTab = false
+		}
 		clearProperty(out, key)
 		return
 	}
@@ -194,8 +181,9 @@ func applyProperty(out *Properties, key, value string) {
 		}
 	case "indent_size":
 		if value == "tab" {
-			out.IndentSize = out.TabWidth
+			state.indentSizeTab = true
 		} else if n := parsePositive(); n > 0 {
+			state.indentSizeTab = false
 			out.IndentSize = n
 		}
 	case "tab_width":

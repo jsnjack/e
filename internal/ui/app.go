@@ -52,11 +52,11 @@ func Run(options Options, paths []string) error {
 	app.ConnectOpen(func(files []gio.Filer, _ string) {
 		logging.Trace("ui: open files", "count", len(files))
 		win := ensureWindow()
+		win.restoreSession()
 		for _, file := range files {
 			win.openPath(file.Path())
 		}
 		if len(win.documents) == 0 {
-			win.restored = true
 			win.newDocument(nil)
 		}
 	})

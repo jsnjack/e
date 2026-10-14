@@ -28,13 +28,16 @@ type searchState struct {
 	generation atomic.Uint64
 	timer      *time.Timer
 	replacing  bool
+	// resumeAt makes the next refresh select the first match at or after
+	// this offset, so Replace never lands inside its own replacement.
+	resumeAt int
 }
 
 func newSearchState(doc *editorDocument) *searchState {
 	tag := gtk.NewTextTag("e-search-match")
 	tag.SetObjectProperty("background", "#f8e45c88")
 	doc.buffer.TagTable().Add(tag)
-	return &searchState{doc: doc, tag: tag, current: -1}
+	return &searchState{doc: doc, tag: tag, current: -1, resumeAt: -1}
 }
 
 func (s *searchState) update(query string) {
@@ -51,6 +54,7 @@ func (s *searchState) scheduleRefresh() {
 	s.doc.buffer.RemoveTag(s.tag, start, end)
 	s.matches = nil
 	s.current = -1
+	s.resumeAt = -1
 	s.updateLabel()
 	s.timer = time.AfterFunc(80*time.Millisecond, func() {
 		dispatch.Main(func() {
@@ -78,6 +82,29 @@ func (s *searchState) refresh() {
 	})
 }
 
+// findExactMatches finds case-sensitive matches; with wholeWord, only matches
+// with no identifier rune on either side.
+func findExactMatches(text, word string, wholeWord bool) []textRange {
+	pattern := regexp.QuoteMeta(word)
+	matches := findRegexp(text, regexp.MustCompile(pattern))
+	if !wholeWord {
+		return matches
+	}
+	runes := []rune(text)
+	kept := matches[:0]
+	for _, match := range matches {
+		if (match.start == 0 || !isIdentifierRune(runes[match.start-1])) &&
+			(match.end == len(runes) || !isIdentifierRune(runes[match.end])) {
+			kept = append(kept, match)
+		}
+	}
+	return kept
+}
+
+func findRegexp(text string, pattern *regexp.Regexp) []textRange {
+	return byteToRuneRanges(text, pattern.FindAllStringIndex(text, -1))
+}
+
 func findMatches(text, query string) []textRange {
 	if query == "" {
 		return nil
@@ -96,6 +123,10 @@ func findMatches(text, query string) []textRange {
 			offset = start + len(query)
 		}
 	}
+	return byteToRuneRanges(text, byteMatches)
+}
+
+func byteToRuneRanges(text string, byteMatches [][]int) []textRange {
 	var matches []textRange
 	byteBase, runeBase := 0, 0
 	for _, match := range byteMatches {
@@ -122,10 +153,19 @@ func (s *searchState) apply(generation uint64, matches []textRange) {
 		}
 		s.doc.buffer.ApplyTag(s.tag, s.doc.buffer.IterAtOffset(match.start), s.doc.buffer.IterAtOffset(match.end))
 	}
-	if len(matches) == 0 {
-		s.current = -1
-	} else if s.current < 0 || s.current >= len(matches) {
+	// Leave no match current until the user moves to one, so the first Find
+	// Next goes to the match after the caret instead of skipping it.
+	s.current = -1
+	if s.resumeAt >= 0 && len(matches) > 0 {
 		s.current = 0
+		for index, match := range matches {
+			if match.start >= s.resumeAt {
+				s.current = index
+				break
+			}
+		}
+		s.resumeAt = -1
+		s.selectCurrent()
 	}
 	s.updateLabel()
 }
@@ -142,6 +182,10 @@ func (s *searchState) updateLabel() {
 		}
 		return
 	}
+	if s.current < 0 {
+		s.doc.window.matchLabel.SetLabel(fmt.Sprintf("%d matches", len(s.matches)))
+		return
+	}
 	s.doc.window.matchLabel.SetLabel(fmt.Sprintf("%d of %d", s.current+1, len(s.matches)))
 }
 
@@ -149,17 +193,46 @@ func (s *searchState) navigate(direction int) {
 	if len(s.matches) == 0 {
 		return
 	}
-	s.current = (s.current + direction + len(s.matches)) % len(s.matches)
-	match := s.matches[s.current]
-	start := s.doc.buffer.IterAtOffset(match.start)
-	end := s.doc.buffer.IterAtOffset(match.end)
-	s.doc.buffer.SelectRange(end, start)
-	s.doc.view.Widget.ScrollToIter(start, .15, false, 0, 0)
+	if s.current < 0 {
+		caret := s.doc.buffer.IterAtMark(s.doc.buffer.GetInsert()).Offset()
+		if direction > 0 {
+			s.current = 0
+			for index, match := range s.matches {
+				if match.start >= caret {
+					s.current = index
+					break
+				}
+			}
+		} else {
+			s.current = len(s.matches) - 1
+			for index := len(s.matches) - 1; index >= 0; index-- {
+				if s.matches[index].end <= caret {
+					s.current = index
+					break
+				}
+			}
+		}
+	} else {
+		s.current = (s.current + direction + len(s.matches)) % len(s.matches)
+	}
+	s.selectCurrent()
 	s.updateLabel()
 }
 
+func (s *searchState) selectCurrent() {
+	match := s.matches[s.current]
+	s.doc.buffer.SelectRange(s.doc.buffer.IterAtOffset(match.end), s.doc.buffer.IterAtOffset(match.start))
+	s.doc.view.Widget.ScrollToMark(s.doc.buffer.GetInsert(), .15, false, 0, 0)
+}
+
+// replaceCurrent replaces the selected match. With no match selected, it
+// first selects the next one, so a replacement is never made out of view.
 func (s *searchState) replaceCurrent(replacement string) {
-	if len(s.matches) == 0 || s.current < 0 {
+	if len(s.matches) == 0 {
+		return
+	}
+	if s.current < 0 {
+		s.navigate(1)
 		return
 	}
 	match := s.matches[s.current]
@@ -175,6 +248,9 @@ func (s *searchState) replaceCurrent(replacement string) {
 	s.doc.buffer.Insert(s.doc.buffer.IterAtOffset(match.start), replacement)
 	s.doc.buffer.EndUserAction()
 	s.replacing = false
+	// The old offsets are stale now; drop them until the refresh lands.
+	s.matches, s.current = nil, -1
+	s.resumeAt = match.start + utf8.RuneCountInString(replacement)
 	s.refresh()
 }
 
@@ -189,6 +265,9 @@ func (s *searchState) replaceAll(replacement string) {
 		}
 	}
 	s.replacing = true
+	// bulkEdit skips the per-change completion, preview, and timer work;
+	// afterMultipleEdit does it once at the end.
+	s.doc.bulkEdit = true
 	s.doc.buffer.BeginUserAction()
 	for index := len(s.matches) - 1; index >= 0; index-- {
 		match := s.matches[index]
@@ -198,9 +277,11 @@ func (s *searchState) replaceAll(replacement string) {
 		s.doc.buffer.Insert(s.doc.buffer.IterAtOffset(match.start), replacement)
 	}
 	s.doc.buffer.EndUserAction()
+	s.doc.bulkEdit = false
 	s.replacing = false
 	s.doc.window.toast(fmt.Sprintf("Replaced %d matches", len(s.matches)))
-	s.refresh()
+	s.doc.dismissCompletion()
+	s.doc.afterMultipleEdit()
 }
 
 func (s *searchState) matchIsCurrent(match textRange) bool {

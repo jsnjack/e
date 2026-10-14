@@ -6,7 +6,6 @@ import (
 	"bufio"
 	"context"
 	"encoding/json"
-	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -14,10 +13,12 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
+	"time"
 )
 
 // Position identifies a UTF-16 line and character offset.
@@ -51,6 +52,9 @@ type Completion struct {
 	Label      string
 	Detail     string
 	InsertText string
+	SortText   string
+	FilterText string
+	Preselect  bool
 	TextEdit   *struct {
 		Range   Range  `json:"range"`
 		NewText string `json:"newText"`
@@ -69,20 +73,47 @@ type response struct {
 	Params json.RawMessage `json:"params,omitempty"`
 }
 
+const (
+	defaultInitializeTimeout = 20 * time.Second
+	defaultShutdownTimeout   = 2 * time.Second
+	defaultExitTimeout       = 2 * time.Second
+)
+
+// timeouts bounds the lifecycle steps; tests shorten them per client.
+type timeouts struct {
+	initialize time.Duration
+	shutdown   time.Duration
+	exit       time.Duration
+}
+
 // Client owns one language-server subprocess.
 type Client struct {
 	command string
 	args    []string
 	rootURI string
 
-	cmd         *exec.Cmd
-	stdin       io.WriteCloser
-	outgoing    chan outbound
+	// stateMu orders Start against Close so a closed client never launches.
+	stateMu sync.Mutex
+	cmd     *exec.Cmd
+	closed  bool
+
+	stdin io.WriteCloser
+	// queueMu guards an unbounded FIFO of outgoing messages. Requests,
+	// notifications, and replies share it so the server sees them in order.
+	queueMu     sync.Mutex
+	queue       []outbound
+	running     bool
+	queueSignal chan struct{}
+
 	nextID      atomic.Int64
 	pendMu      sync.Mutex
 	pending     map[int64]chan response
 	diagnostics func(string, []Diagnostic)
 	done        chan struct{}
+	closeOnce   sync.Once
+	waitOnce    sync.Once
+	exited      chan struct{}
+	timeouts    timeouts
 }
 
 type outbound struct {
@@ -93,37 +124,32 @@ type outbound struct {
 // New constructs a client. Start must be called before document operations.
 func New(command string, args []string, root string, diagnostics func(string, []Diagnostic)) *Client {
 	rootURI := FileURI(root)
-	return &Client{command: command, args: append([]string(nil), args...), rootURI: rootURI, pending: make(map[int64]chan response), diagnostics: diagnostics, done: make(chan struct{})}
+	return &Client{
+		command: command, args: append([]string(nil), args...), rootURI: rootURI,
+		pending: make(map[int64]chan response), diagnostics: diagnostics,
+		done: make(chan struct{}), queueSignal: make(chan struct{}, 1), exited: make(chan struct{}),
+		timeouts: timeouts{defaultInitializeTimeout, defaultShutdownTimeout, defaultExitTimeout},
+	}
 }
 
-// Start launches and initializes the language server.
+// Start launches and initializes the language server. The process lives until
+// ctx is cancelled or Close is called; initialize alone is bounded by a 20 s
+// timeout. A failed initialize closes the client and reaps the process.
 func (c *Client) Start(ctx context.Context) error {
 	if strings.TrimSpace(c.command) == "" {
 		return fmt.Errorf("language-server command is empty")
 	}
-	c.cmd = exec.CommandContext(ctx, c.command, c.args...)
-	stdout, err := c.cmd.StdoutPipe()
+	stdout, stderr, err := c.launch(ctx)
 	if err != nil {
-		return fmt.Errorf("open language-server stdout: %w", err)
+		return err
 	}
-	stdin, err := c.cmd.StdinPipe()
-	if err != nil {
-		return fmt.Errorf("open language-server stdin: %w", err)
-	}
-	stderr, err := c.cmd.StderrPipe()
-	if err != nil {
-		return fmt.Errorf("open language-server stderr: %w", err)
-	}
-	c.stdin = stdin
-	if err := c.cmd.Start(); err != nil {
-		return fmt.Errorf("start language server %s: %w", c.command, err)
-	}
-	c.outgoing = make(chan outbound, 256)
 	go c.writeLoop()
 	go c.readLoop(stdout)
 	go c.logStderr(stderr)
+	initCtx, cancel := context.WithTimeout(ctx, c.timeouts.initialize)
+	defer cancel()
 	var initialized json.RawMessage
-	if err := c.call(ctx, "initialize", map[string]any{
+	if err := c.call(initCtx, "initialize", map[string]any{
 		"processId": osProcessID(), "rootUri": c.rootURI,
 		"capabilities": map[string]any{
 			"textDocument": map[string]any{
@@ -132,12 +158,100 @@ func (c *Client) Start(ctx context.Context) error {
 			},
 		},
 	}, &initialized); err != nil {
+		c.Close()
 		return fmt.Errorf("initialize language server: %w", err)
 	}
 	if err := c.notify("initialized", map[string]any{}); err != nil {
+		c.Close()
 		return fmt.Errorf("notify initialized: %w", err)
 	}
 	return nil
+}
+
+func (c *Client) launch(ctx context.Context) (io.Reader, io.Reader, error) {
+	c.stateMu.Lock()
+	defer c.stateMu.Unlock()
+	if c.closed {
+		return nil, nil, fmt.Errorf("language-server client is closed")
+	}
+	if c.cmd != nil {
+		return nil, nil, fmt.Errorf("language server already started")
+	}
+	cmd := exec.CommandContext(ctx, c.command, c.args...)
+	stdout, err := cmd.StdoutPipe()
+	if err != nil {
+		return nil, nil, fmt.Errorf("open language-server stdout: %w", err)
+	}
+	stdin, err := cmd.StdinPipe()
+	if err != nil {
+		return nil, nil, fmt.Errorf("open language-server stdin: %w", err)
+	}
+	stderr, err := cmd.StderrPipe()
+	if err != nil {
+		return nil, nil, fmt.Errorf("open language-server stderr: %w", err)
+	}
+	if err := cmd.Start(); err != nil {
+		return nil, nil, fmt.Errorf("start language server %s: %w", c.command, err)
+	}
+	c.cmd = cmd
+	c.stdin = stdin
+	c.queueMu.Lock()
+	c.running = true
+	c.queueMu.Unlock()
+	return stdout, stderr, nil
+}
+
+// Close stops the language server in the background and returns immediately.
+// It is safe to call any number of times, concurrently, and before or during
+// Start. The first call marks the client closed so a later Start fails. If the
+// process is running, a goroutine sends shutdown (2 s timeout) and exit, waits
+// up to 2 s for the process to exit, kills it otherwise, and reaps it.
+func (c *Client) Close() {
+	c.closeOnce.Do(func() {
+		c.stateMu.Lock()
+		c.closed = true
+		cmd := c.cmd
+		c.stateMu.Unlock()
+		if cmd == nil {
+			return
+		}
+		go c.stop(cmd)
+	})
+}
+
+func (c *Client) stop(cmd *exec.Cmd) {
+	select {
+	case <-c.done:
+	default:
+		ctx, cancel := context.WithTimeout(context.Background(), c.timeouts.shutdown)
+		var ignored json.RawMessage
+		if err := c.call(ctx, "shutdown", nil, &ignored); err != nil {
+			slog.Debug("shut down language server", "command", c.command, "err", err)
+		}
+		cancel()
+		if err := c.notify("exit", nil); err != nil {
+			slog.Debug("notify language-server exit", "command", c.command, "err", err)
+		}
+	}
+	select {
+	case <-c.done:
+	case <-time.After(c.timeouts.exit):
+		if err := cmd.Process.Kill(); err != nil {
+			slog.Debug("kill language server", "command", c.command, "err", err)
+		}
+	}
+	c.reap(cmd)
+}
+
+// reap waits for the subprocess exactly once, whichever of readLoop and stop
+// gets there first.
+func (c *Client) reap(cmd *exec.Cmd) {
+	c.waitOnce.Do(func() {
+		if err := cmd.Wait(); err != nil {
+			slog.Debug("language server exited", "command", c.command, "err", err)
+		}
+		close(c.exited)
+	})
 }
 
 // Open notifies the server of an opened document.
@@ -165,7 +279,8 @@ func (c *Client) CloseDocument(uri string) error {
 	return c.notify("textDocument/didClose", map[string]any{"textDocument": map[string]any{"uri": uri}})
 }
 
-// Completions requests semantic completion at position.
+// Completions requests semantic completion at position. Items come back with
+// preselected items first, then ordered by sortText (label when absent).
 func (c *Client) Completions(ctx context.Context, uri string, position Position) ([]Completion, error) {
 	var raw json.RawMessage
 	if err := c.call(ctx, "textDocument/completion", map[string]any{
@@ -181,6 +296,9 @@ func decodeCompletions(raw json.RawMessage) ([]Completion, error) {
 		Label      string `json:"label"`
 		Detail     string `json:"detail"`
 		InsertText string `json:"insertText"`
+		SortText   string `json:"sortText"`
+		FilterText string `json:"filterText"`
+		Preselect  bool   `json:"preselect"`
 		TextEdit   *struct {
 			Range   Range  `json:"range"`
 			NewText string `json:"newText"`
@@ -207,21 +325,26 @@ func decodeCompletions(raw json.RawMessage) ([]Completion, error) {
 		if insert == "" {
 			insert = item.Label
 		}
-		out = append(out, Completion{Label: item.Label, Detail: item.Detail, InsertText: insert, TextEdit: item.TextEdit})
+		out = append(out, Completion{
+			Label: item.Label, Detail: item.Detail, InsertText: insert,
+			SortText: item.SortText, FilterText: item.FilterText, Preselect: item.Preselect,
+			TextEdit: item.TextEdit,
+		})
 	}
+	sort.SliceStable(out, func(i, j int) bool {
+		if out[i].Preselect != out[j].Preselect {
+			return out[i].Preselect
+		}
+		return sortKey(out[i]) < sortKey(out[j])
+	})
 	return out, nil
 }
 
-// Shutdown asks the server to exit and waits for the subprocess.
-func (c *Client) Shutdown(ctx context.Context) error {
-	if c.cmd == nil {
-		return nil
+func sortKey(item Completion) string {
+	if item.SortText != "" {
+		return item.SortText
 	}
-	var ignored json.RawMessage
-	callErr := c.call(ctx, "shutdown", nil, &ignored)
-	notifyErr := c.notify("exit", nil)
-	waitErr := c.cmd.Wait()
-	return errorsJoin(callErr, notifyErr, waitErr)
+	return item.Label
 }
 
 func (c *Client) call(ctx context.Context, method string, params any, out any) error {
@@ -235,7 +358,7 @@ func (c *Client) call(ctx context.Context, method string, params any, out any) e
 		delete(c.pending, id)
 		c.pendMu.Unlock()
 	}()
-	if err := c.write(ctx, map[string]any{"jsonrpc": "2.0", "id": id, "method": method, "params": params}); err != nil {
+	if err := c.write(ctx, message(id, method, params)); err != nil {
 		return err
 	}
 	select {
@@ -260,37 +383,54 @@ func (c *Client) call(ctx context.Context, method string, params any, out any) e
 	}
 }
 
+// message builds a JSON-RPC request (id > 0) or notification, leaving out
+// params when there are none.
+func message(id int64, method string, params any) map[string]any {
+	msg := map[string]any{"jsonrpc": "2.0", "method": method}
+	if id > 0 {
+		msg["id"] = id
+	}
+	if params != nil {
+		msg["params"] = params
+	}
+	return msg
+}
+
+// notify queues a notification. It never blocks on the server pipe and never
+// drops a message while the server is running.
 func (c *Client) notify(method string, params any) error {
-	if c.outgoing == nil {
+	select {
+	case <-c.done:
+		return fmt.Errorf("language server exited")
+	default:
+	}
+	return c.enqueue(outbound{message: message(0, method, params)})
+}
+
+func (c *Client) enqueue(item outbound) error {
+	c.queueMu.Lock()
+	if !c.running {
+		c.queueMu.Unlock()
 		return fmt.Errorf("language server is not running")
 	}
+	c.queue = append(c.queue, item)
+	c.queueMu.Unlock()
 	select {
-	case <-c.done:
-		return fmt.Errorf("language server exited")
+	case c.queueSignal <- struct{}{}:
 	default:
 	}
-	request := outbound{message: map[string]any{"jsonrpc": "2.0", "method": method, "params": params}}
-	select {
-	case c.outgoing <- request:
-		return nil
-	case <-c.done:
-		return fmt.Errorf("language server exited")
-	default:
-		return fmt.Errorf("language-server write queue is full")
-	}
+	return nil
 }
 
 func (c *Client) write(ctx context.Context, message any) error {
-	if c.outgoing == nil {
-		return fmt.Errorf("language server is not running")
-	}
-	result := make(chan error, 1)
 	select {
-	case c.outgoing <- outbound{message: message, result: result}:
-	case <-ctx.Done():
-		return ctx.Err()
 	case <-c.done:
 		return fmt.Errorf("language server exited")
+	default:
+	}
+	result := make(chan error, 1)
+	if err := c.enqueue(outbound{message: message, result: result}); err != nil {
+		return err
 	}
 	select {
 	case err := <-result:
@@ -304,10 +444,19 @@ func (c *Client) write(ctx context.Context, message any) error {
 
 func (c *Client) writeLoop() {
 	for {
-		select {
-		case <-c.done:
-			return
-		case request := <-c.outgoing:
+		c.queueMu.Lock()
+		batch := c.queue
+		c.queue = nil
+		c.queueMu.Unlock()
+		if len(batch) == 0 {
+			select {
+			case <-c.done:
+				return
+			case <-c.queueSignal:
+				continue
+			}
+		}
+		for _, request := range batch {
 			err := c.writeDirect(request.message)
 			if request.result != nil {
 				request.result <- err
@@ -336,7 +485,15 @@ func (c *Client) writeDirect(message any) error {
 }
 
 func (c *Client) readLoop(reader io.Reader) {
-	defer close(c.done)
+	defer func() {
+		close(c.done)
+		c.stateMu.Lock()
+		cmd := c.cmd
+		c.stateMu.Unlock()
+		if cmd != nil {
+			c.reap(cmd)
+		}
+	}()
 	buffered := bufio.NewReader(reader)
 	for {
 		body, err := readFrame(buffered)
@@ -346,33 +503,66 @@ func (c *Client) readLoop(reader io.Reader) {
 			}
 			return
 		}
-		var message response
-		if err := json.Unmarshal(body, &message); err != nil {
-			slog.Debug("decode language-server message", "err", err)
-			continue
+		c.handle(body)
+	}
+}
+
+func (c *Client) handle(body []byte) {
+	var message response
+	if err := json.Unmarshal(body, &message); err != nil {
+		slog.Debug("decode language-server message", "err", err)
+		return
+	}
+	hasID := len(message.ID) > 0 && string(message.ID) != "null"
+	switch {
+	case message.Method != "" && hasID:
+		c.answerServerRequest(message)
+	case hasID:
+		id, err := strconv.ParseInt(strings.Trim(string(message.ID), "\""), 10, 64)
+		if err != nil {
+			return
 		}
-		if len(message.ID) > 0 {
-			id, err := strconv.ParseInt(strings.Trim(string(message.ID), "\""), 10, 64)
-			if err != nil {
-				continue
-			}
-			c.pendMu.Lock()
-			ch := c.pending[id]
-			c.pendMu.Unlock()
-			if ch != nil {
-				ch <- message
-			}
-			continue
-		}
-		if message.Method == "textDocument/publishDiagnostics" && c.diagnostics != nil {
-			var params struct {
-				URI         string       `json:"uri"`
-				Diagnostics []Diagnostic `json:"diagnostics"`
-			}
-			if err := json.Unmarshal(message.Params, &params); err == nil {
-				c.diagnostics(params.URI, params.Diagnostics)
+		c.pendMu.Lock()
+		ch := c.pending[id]
+		c.pendMu.Unlock()
+		if ch != nil {
+			select {
+			case ch <- message:
+			default:
 			}
 		}
+	case message.Method == "textDocument/publishDiagnostics" && c.diagnostics != nil:
+		var params struct {
+			URI         string       `json:"uri"`
+			Diagnostics []Diagnostic `json:"diagnostics"`
+		}
+		if err := json.Unmarshal(message.Params, &params); err == nil {
+			c.diagnostics(params.URI, params.Diagnostics)
+		}
+	}
+}
+
+// answerServerRequest replies to a server-to-client request. Servers such as
+// gopls block until these requests are answered.
+func (c *Client) answerServerRequest(request response) {
+	reply := map[string]any{"jsonrpc": "2.0", "id": request.ID}
+	switch request.Method {
+	case "workspace/configuration":
+		var params struct {
+			Items []json.RawMessage `json:"items"`
+		}
+		if err := json.Unmarshal(request.Params, &params); err != nil {
+			slog.Debug("decode workspace/configuration", "err", err)
+		}
+		reply["result"] = make([]any, len(params.Items))
+	case "client/registerCapability", "client/unregisterCapability",
+		"window/workDoneProgress/create", "window/showMessageRequest":
+		reply["result"] = nil
+	default:
+		reply["error"] = map[string]any{"code": -32601, "message": "method not found"}
+	}
+	if err := c.enqueue(outbound{message: reply}); err != nil {
+		slog.Debug("answer language-server request", "method", request.Method, "err", err)
 	}
 }
 
@@ -425,16 +615,3 @@ func FileURI(path string) string {
 }
 
 func osProcessID() int { return os.Getpid() }
-
-func errorsJoin(errs ...error) error {
-	var present []error
-	for _, err := range errs {
-		if err != nil {
-			present = append(present, err)
-		}
-	}
-	if len(present) == 0 {
-		return nil
-	}
-	return fmt.Errorf("stop language server: %w", errors.Join(present...))
-}

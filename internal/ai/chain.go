@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"net"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -12,6 +13,7 @@ import (
 const (
 	probeInterval   = 30 * time.Second
 	failureCooldown = time.Minute
+	slowCooldown    = 30 * time.Second
 )
 
 type providerState struct {
@@ -20,6 +22,9 @@ type providerState struct {
 	healthy  bool
 	checked  bool
 	failedAt time.Time
+	// slowUntil benches a provider whose last generation timed out, so the
+	// next requests go to a faster fallback instead of waiting again.
+	slowUntil time.Time
 }
 
 // Chain tries providers in priority order while skipping known-unavailable entries.
@@ -56,27 +61,39 @@ func (c *Chain) Start(ctx context.Context) {
 
 func (c *Chain) probe(ctx context.Context) {
 	for _, state := range c.providers {
-		state := state
-		go func() {
-			probeCtx, cancel := context.WithTimeout(ctx, 1500*time.Millisecond)
-			defer cancel()
-			err := state.provider.Healthy(probeCtx)
-			state.mu.Lock()
-			state.checked = true
-			state.healthy = err == nil
-			if err == nil {
-				state.failedAt = time.Time{}
-			} else {
-				state.failedAt = time.Now()
-			}
-			state.mu.Unlock()
-		}()
+		go state.probe(ctx)
 	}
 }
 
-func (s *providerState) available() bool {
+func (s *providerState) probe(ctx context.Context) {
+	probeCtx, cancel := context.WithTimeout(ctx, 1500*time.Millisecond)
+	defer cancel()
+	err := s.provider.Healthy(probeCtx)
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	s.checked = true
+	s.healthy = err == nil
+	if err == nil {
+		s.failedAt = time.Time{}
+	} else if s.failedAt.IsZero() {
+		// Keep the first failure time; refreshing it on every probe would stop
+		// failureCooldown from ever elapsing.
+		s.failedAt = time.Now()
+	}
+}
+
+// available reports whether the provider should be tried. With skipSlow, a
+// provider benched after a timeout is skipped until slowUntil passes.
+func (s *providerState) available(skipSlow bool) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if skipSlow && time.Now().Before(s.slowUntil) {
+		return false
+	}
+	return s.reachable()
+}
+
+func (s *providerState) reachable() bool {
 	if !s.checked {
 		return true
 	}
@@ -89,14 +106,16 @@ func (s *providerState) available() bool {
 func (s *providerState) result(err error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if err != nil && errors.Is(err, context.DeadlineExceeded) {
-		// Slow inference is not evidence that the endpoint is unavailable. Keep
-		// it eligible so a later request can succeed after a cold model loads.
+	if err != nil && isTimeout(err) {
+		// Slow inference is not evidence that the endpoint is down, so it is
+		// not marked failed. It is benched briefly so fallbacks answer first.
 		s.checked = false
 		s.healthy = false
 		s.failedAt = time.Time{}
+		s.slowUntil = time.Now().Add(slowCooldown)
 		return
 	}
+	s.slowUntil = time.Time{}
 	s.checked = true
 	s.healthy = err == nil
 	if err == nil {
@@ -106,39 +125,51 @@ func (s *providerState) result(err error) {
 	}
 }
 
-// Complete asks the first available provider, falling through on pre-output errors.
-func (c *Chain) Complete(ctx context.Context, req Request) (string, error) {
-	result, err := c.complete(ctx, req)
-	return result.Text, err
-}
-
+// complete asks the first available provider, falling through on pre-output
+// errors. Providers benched as slow are tried only when no other is available.
 func (c *Chain) complete(ctx context.Context, req Request) (Result, error) {
 	if len(c.providers) == 0 {
 		return Result{}, fmt.Errorf("no autocomplete models configured")
 	}
 	var errs []error
-	tried := 0
-	for index, state := range c.providers {
-		if !state.available() {
-			continue
+	tried := make([]bool, len(c.providers))
+	attempts := 0
+	for _, skipSlow := range []bool{true, false} {
+		for index, state := range c.providers {
+			if tried[index] || !state.available(skipSlow) {
+				continue
+			}
+			tried[index] = true
+			attempts++
+			result, err := state.provider.Complete(ctx, req)
+			if err != nil && (errors.Is(err, context.Canceled) || ctx.Err() != nil) {
+				return Result{}, err
+			}
+			state.result(err)
+			if err != nil {
+				errs = append(errs, fmt.Errorf("%s: %w", state.provider.Label(), err))
+				continue
+			}
+			c.active.Store(int32(index))
+			return Result{Text: result, Model: state.provider.Label(), Fallback: index > 0}, nil
 		}
-		tried++
-		result, err := state.provider.Complete(ctx, req)
-		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) && ctx.Err() != nil {
-			return Result{}, err
+		if attempts > 0 {
+			break
 		}
-		state.result(err)
-		if err != nil {
-			errs = append(errs, fmt.Errorf("%s: %w", state.provider.Label(), err))
-			continue
-		}
-		c.active.Store(int32(index))
-		return Result{Text: result, Model: state.provider.Label(), Fallback: index > 0}, nil
 	}
-	if tried == 0 {
+	if attempts == 0 {
 		return Result{}, fmt.Errorf("no autocomplete model is currently available")
 	}
 	return Result{}, errors.Join(errs...)
+}
+
+// isTimeout reports a provider-side timeout such as http.Client.Timeout.
+func isTimeout(err error) bool {
+	if errors.Is(err, context.DeadlineExceeded) {
+		return true
+	}
+	var netErr net.Error
+	return errors.As(err, &netErr) && netErr.Timeout()
 }
 
 // ActiveModel reports which provider last succeeded.

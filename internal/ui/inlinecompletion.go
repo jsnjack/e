@@ -34,11 +34,11 @@ type inlineCompletionRenderer struct {
 	tabWidth func() int
 	dismiss  func()
 
-	tick                  uint
-	frameClock            *gdk.FrameClock
-	layoutSignal          coreglib.SignalHandle
-	viewWidth, viewHeight int
-	wrapMode              gtk.WrapMode
+	tick         uint
+	frameClock   *gdk.FrameClock
+	layoutSignal coreglib.SignalHandle
+	viewWidth    int
+	wrapMode     gtk.WrapMode
 
 	// text is the visible ghost text; it is empty while nothing is shown.
 	text string
@@ -100,10 +100,11 @@ func (r *inlineCompletionRenderer) show(suggestion string, cursor *gtk.TextIter)
 	return true
 }
 
-// watchLayout dismisses the suggestion when a resize or wrap change moves the
-// caret away from the drawn position.
+// watchLayout dismisses the suggestion when a width or wrap change reflows
+// the text. The suggestion is drawn in buffer coordinates, so a height change,
+// such as the status bar growing, does not move it.
 func (r *inlineCompletionRenderer) watchLayout() {
-	r.viewWidth, r.viewHeight = r.view.Width(), r.view.Height()
+	r.viewWidth = r.view.Width()
 	r.wrapMode = r.view.WrapMode()
 	r.tick = r.view.AddTickCallback(func(_ gtk.Widgetter, clock gdk.FrameClocker) bool {
 		r.tick = 0
@@ -123,7 +124,10 @@ func (r *inlineCompletionRenderer) watchLayout() {
 }
 
 func (r *inlineCompletionRenderer) layoutChanged() bool {
-	return r.view.Width() != r.viewWidth || r.view.Height() != r.viewHeight || r.view.WrapMode() != r.wrapMode
+	if r.view.WrapMode() != r.wrapMode {
+		return true
+	}
+	return r.wrapMode != gtk.WrapNone && r.view.Width() != r.viewWidth
 }
 
 // caretColumn returns the caret's visual column for tab expansion.

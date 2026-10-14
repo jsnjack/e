@@ -218,6 +218,10 @@ func (s *activitySurface) updateDocument(doc *editorDocument) {
 		details = append(details, doc.path)
 	}
 	s.document.SetTooltipText(strings.Join(details, " · "))
+	if len(doc.multiCursors) > 1 {
+		s.cursor.SetText(fmt.Sprintf("%d cursors", len(doc.multiCursors)))
+		return
+	}
 	insert := doc.buffer.IterAtMark(doc.buffer.GetInsert())
 	s.cursor.SetText(fmt.Sprintf("Ln %d, Col %d", insert.Line()+1, insert.LineOffset()+1))
 }
@@ -307,7 +311,8 @@ func (s *activitySurface) removeRunning(id uint64, removeLog bool) *runningActiv
 			break
 		}
 	}
-	if removeLog && running.row != nil {
+	// The history limit may already have evicted this row.
+	if removeLog && running.row != nil && running.row.box.Parent() != nil {
 		s.logBox.Remove(running.row.box)
 		for index, row := range s.history {
 			if row == running.row {

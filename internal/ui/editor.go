@@ -5,13 +5,14 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
+	"io/fs"
 	"log/slog"
 	"os"
 	"path/filepath"
 	"strings"
 	"sync/atomic"
 	"time"
-	"unicode/utf16"
 	"unicode/utf8"
 
 	"github.com/diamondburned/gotk4-adwaita/pkg/adw"
@@ -51,13 +52,17 @@ type editorDocument struct {
 	previewBusy    bool
 	previewPending bool
 
-	id          string
-	path        string
-	newline     document.Newline
-	mode        os.FileMode
-	modTime     int64
-	props       editorconfig.Properties
-	loading     bool
+	id      string
+	path    string
+	newline document.Newline
+	bom     bool
+	mode    os.FileMode
+	modTime int64
+	props   editorconfig.Properties
+	loading bool
+	// pending is the session state of a document that is still loading, so
+	// a session save during loading keeps its recovery copy.
+	pending     *document.Snapshot
 	closed      bool
 	revision    uint64
 	bulkEdit    bool
@@ -71,8 +76,11 @@ type editorDocument struct {
 	ghostText        string
 	ghostOffset      int
 	completionText   string
-	replaceStart     int
-	replaceEnd       int
+	// typedThrough is text being inserted that matches the start of the
+	// visible suggestion; the changed handler then shows the rest.
+	typedThrough string
+	replaceStart int
+	replaceEnd   int
 
 	saveRunning bool
 	saveQueue   []*saveRequest
@@ -87,9 +95,11 @@ type editorDocument struct {
 	watching   bool
 	diskWarn   bool
 
-	multiCursors        []multiCursor
-	multiTag            *gtk.TextTag
-	carets              []*gtk.Label
+	multiCursors []multiCursor
+	multiTag     *gtk.TextTag
+	// verticalX is the column, in buffer pixels, kept while adding cursors
+	// above or below; -1 when no vertical group is active.
+	verticalX           int
 	brandTag            *gtk.TextTag
 	brandStyleSignals   []glib.SignalHandle
 	brandScanGen        uint64
@@ -103,6 +113,7 @@ type saveRequest struct {
 	text            []byte
 	prepared        []byte
 	newline         document.Newline
+	bom             bool
 	mode            os.FileMode
 	props           editorconfig.Properties
 	expectedModTime int64
@@ -131,7 +142,7 @@ func (w *window) newDocument(snapshot *document.Snapshot) *editorDocument {
 	doc := &editorDocument{
 		window: w, view: view, buffer: view.Buffer,
 		id:      fmt.Sprintf("%d-%d", time.Now().UnixNano(), documentSequence.Add(1)),
-		newline: document.NewlineLF, mode: 0o644,
+		newline: document.NewlineLF,
 	}
 	doc.configureView()
 	scroll := gtk.NewScrolledWindow()
@@ -155,10 +166,17 @@ func (w *window) newDocument(snapshot *document.Snapshot) *editorDocument {
 		doc.id = snapshot.ID
 		doc.path = snapshot.Path
 		doc.newline = snapshot.Newline
+		pending := *snapshot
+		doc.pending = &pending
 		if len(snapshot.Text) > 0 || snapshot.Modified || snapshot.Path == "" {
-			doc.insertChunks(snapshot.Text, snapshot.Modified, snapshot.Cursor, nil, nil)
+			savedModTime := snapshot.ModTime
+			doc.insertChunks(snapshot.Text, snapshot.Modified, snapshot.Cursor, nil, func(complete bool) {
+				if complete && doc.path != "" {
+					doc.attachRestoredFile(savedModTime)
+				}
+			})
 		} else {
-			doc.load(snapshot.Path)
+			doc.load(snapshot.Path, snapshot.Cursor)
 		}
 	} else {
 		doc.buffer.SetModified(false)
@@ -200,6 +218,7 @@ func (d *editorDocument) connectSignals() {
 			return
 		}
 		d.revision++
+		d.window.scheduleSessionSave()
 		if d.transformCancel != nil {
 			d.transformCancel()
 			d.transformCancel = nil
@@ -210,8 +229,10 @@ func (d *editorDocument) connectSignals() {
 		if len(d.multiCursors) > 0 {
 			d.clearMultipleSelections()
 		}
-		d.dismissCompletion()
-		d.scheduleCompletion()
+		if !d.continueCompletion() {
+			d.dismissCompletion()
+			d.scheduleCompletion()
+		}
 		d.scheduleMarkdownPreview()
 		if d.search != nil && d.search.query != "" && !d.search.replacing {
 			d.search.scheduleRefresh()
@@ -224,14 +245,25 @@ func (d *editorDocument) connectSignals() {
 		// behind after keyboard navigation.
 		if mark != nil && mark.Name() == "insert" {
 			d.dismissCompletion()
+		}
+	})
+	// Typing moves the caret by mark gravity, which emits no mark-set, so the
+	// status bar position follows cursor-position instead.
+	d.buffer.NotifyProperty("cursor-position", func() {
+		if d.window.active() == d {
 			d.window.updateTitle(d)
 		}
 	})
 	d.buffer.ConnectInsertText(func(location *gtk.TextIter, text string, _ int) {
+		d.typedThrough = ""
+		if d.ghostText != "" && !d.loading && !d.bulkEdit && text != "" && location.Offset() == d.ghostOffset &&
+			d.replaceStart == d.replaceEnd && strings.HasPrefix(d.completionText, text) {
+			d.typedThrough = text
+		}
 		if !d.loading {
 			d.scheduleBrandRange(location.Offset()-1, location.Offset()+utf8.RuneCountInString(text)+1)
 		}
-		if d.loading || d.bulkEdit || !d.lspReady {
+		if d.loading || !d.lspReady {
 			return
 		}
 		d.lspVer++
@@ -244,7 +276,7 @@ func (d *editorDocument) connectSignals() {
 		if !d.loading {
 			d.scheduleBrandRange(start.Offset()-1, start.Offset()+2)
 		}
-		if d.loading || d.bulkEdit || !d.lspReady {
+		if d.loading || !d.lspReady {
 			return
 		}
 		d.lspVer++
@@ -261,7 +293,9 @@ func (d *editorDocument) connectSignals() {
 }
 
 func (d *editorDocument) keyPressed(keyval, _ uint, state gdk.ModifierType) bool {
-	if state&(gdk.ShiftMask|gdk.AltMask) == gdk.ShiftMask|gdk.AltMask && state&(gdk.ControlMask|gdk.SuperMask) == 0 {
+	// Ctrl+Shift+Up/Down (VS Code on Linux) and Shift+Alt+Up/Down add cursors.
+	modifiers := state & (gdk.ShiftMask | gdk.AltMask | gdk.ControlMask | gdk.SuperMask)
+	if modifiers == gdk.ShiftMask|gdk.AltMask || modifiers == gdk.ShiftMask|gdk.ControlMask {
 		switch keyval {
 		case gdk.KEY_Up:
 			d.addCursorVertically(-1)
@@ -284,6 +318,14 @@ func (d *editorDocument) keyPressed(keyval, _ uint, state gdk.ModifierType) bool
 	case gdk.KEY_Tab:
 		if d.ghostText != "" {
 			d.acceptCompletion(false)
+			return true
+		}
+	case gdk.KEY_y:
+		// GtkTextView binds only Ctrl+Shift+Z for redo.
+		if state&(gdk.ControlMask|gdk.ShiftMask|gdk.AltMask) == gdk.ControlMask {
+			if d.buffer.CanRedo() {
+				d.buffer.Redo()
+			}
 			return true
 		}
 	case gdk.KEY_Right:
@@ -314,7 +356,13 @@ func (d *editorDocument) updatePresentation() {
 	}
 }
 
-func (d *editorDocument) load(path string) {
+func (d *editorDocument) load(path string, cursor int) {
+	if abs, err := filepath.Abs(path); err == nil {
+		path = abs
+	}
+	if d.pending == nil {
+		d.pending = &document.Snapshot{ID: d.id, Path: path, Title: filepath.Base(path), Cursor: cursor, Newline: d.newline}
+	}
 	d.loading = true
 	d.view.Widget.SetEditable(false)
 	d.page.SetLoading(true)
@@ -333,15 +381,34 @@ func (d *editorDocument) load(path string) {
 			}
 			if err != nil {
 				d.loading = false
+				d.pending = nil
 				d.view.Widget.SetEditable(true)
 				d.page.SetLoading(false)
+				if errors.Is(err, fs.ErrNotExist) {
+					// A missing path opens as a new, empty file with that name.
+					d.path, d.modTime = path, 0
+					d.view.SetLanguage(path, "")
+					d.updatePresentation()
+					operation.Finish("new file", "", false)
+					return
+				}
 				operation.Fail(err)
 				slog.Warn("open document", "path", path, "err", err)
+				d.window.toast(fmt.Sprintf("Couldn’t open “%s”", filepath.Base(path)))
+				if d.buffer.CharCount() > 0 {
+					// A failed reload keeps the previous text and stops retrying.
+					d.diskWarn = true
+					return
+				}
+				// Never keep a path whose content was not loaded: saving would
+				// replace the real file with an empty buffer.
+				d.path = ""
+				d.window.tabs.ClosePage(d.page)
 				return
 			}
-			d.path, d.newline, d.mode, d.modTime, d.props = file.Path, file.Newline, file.Mode, file.ModTime, props
+			d.path, d.newline, d.bom, d.mode, d.modTime, d.props = file.Path, file.Newline, file.BOM, file.Mode, file.ModTime, props
 			d.diskWarn = false
-			d.insertChunks(file.Text, false, 0, func(current, total int) {
+			d.insertChunks(file.Text, false, cursor, func(current, total int) {
 				operation.Progress(int64(current), int64(total))
 			}, func(complete bool) {
 				if !complete {
@@ -377,8 +444,7 @@ func (d *editorDocument) insertChunks(data []byte, modified bool, cursor int, pr
 			for end > offset && end < len(data) && !utf8.RuneStart(data[end]) {
 				end--
 			}
-			iter := d.buffer.IterAtOffset(d.buffer.CharCount())
-			d.buffer.Insert(iter, string(data[offset:end]))
+			d.buffer.Insert(d.buffer.EndIter(), string(data[offset:end]))
 			offset = end
 			if progress != nil {
 				progress(offset, len(data))
@@ -393,6 +459,7 @@ func (d *editorDocument) insertChunks(data []byte, modified bool, cursor int, pr
 		d.buffer.SetModified(modified)
 		d.buffer.PlaceCursor(d.buffer.IterAtOffset(min(cursor, d.buffer.CharCount())))
 		d.loading = false
+		d.pending = nil
 		d.view.Widget.SetEditable(true)
 		d.page.SetLoading(false)
 		d.updatePresentation()
@@ -402,6 +469,45 @@ func (d *editorDocument) insertChunks(data []byte, modified bool, cursor int, pr
 		}
 		return false
 	})
+}
+
+// attachRestoredFile reads the metadata of a file whose unsaved text came from
+// the session. A savedModTime that differs from the disk makes the next save
+// ask before overwriting changes made while E was closed.
+func (d *editorDocument) attachRestoredFile(savedModTime int64) {
+	path := d.path
+	go func() {
+		info, statErr := os.Stat(path)
+		bom := false
+		if statErr == nil {
+			if file, err := os.Open(path); err == nil {
+				head := make([]byte, 3)
+				n, _ := io.ReadFull(file, head)
+				bom = bytes.Equal(head[:n], []byte{0xef, 0xbb, 0xbf})
+				_ = file.Close()
+			}
+		}
+		props, propsErr := editorconfig.Resolve(path)
+		dispatch.Main(func() {
+			if d.closed || d.path != path {
+				return
+			}
+			if statErr == nil {
+				d.mode = info.Mode() & (os.ModePerm | os.ModeSetuid | os.ModeSetgid | os.ModeSticky)
+				d.bom = bom
+				d.modTime = savedModTime
+				if d.modTime == 0 {
+					d.modTime = info.ModTime().UnixNano()
+				}
+			}
+			if propsErr == nil {
+				d.props = props
+				d.applyEditorConfig()
+			}
+			d.startLSP()
+			d.startExternalWatch()
+		})
+	}()
 }
 
 func (d *editorDocument) textSnapshotAsync(valid func() bool, done func(string)) {
@@ -424,26 +530,54 @@ func (d *editorDocument) textSnapshotAsync(valid func() bool, done func(string))
 	})
 }
 
-func (d *editorDocument) applyEditorConfig() {
-	tabWidth := d.window.options.Config.Editor.TabWidth
-	indentWidth := -1
-	spaces := d.window.options.Config.Editor.InsertSpaces
-	if d.props.TabWidth > 0 {
-		tabWidth = d.props.TabWidth
-	}
-	if d.props.IndentSize > 0 {
-		indentWidth = d.props.IndentSize
-	}
+// indentation returns whether Tab inserts spaces, and the indent width in
+// columns, after EditorConfig overrides.
+func (d *editorDocument) indentation() (spaces bool, width int) {
+	spaces = d.window.options.Config.Editor.InsertSpaces
 	if d.props.IndentStyle != "" {
 		spaces = d.props.IndentStyle == "space"
 	}
-	d.view.SetOptions(d.window.options.Config.Editor.LineNumbers, true, spaces, tabWidth, indentWidth)
+	width = d.tabWidth()
+	if d.props.IndentSize > 0 {
+		width = d.props.IndentSize
+	}
+	return spaces, width
+}
+
+func (d *editorDocument) applyEditorConfig() {
+	indentWidth := -1
+	if d.props.IndentSize > 0 {
+		indentWidth = d.props.IndentSize
+	}
+	spaces, _ := d.indentation()
+	d.view.SetOptions(d.window.options.Config.Editor.LineNumbers, true, spaces, d.tabWidth(), indentWidth)
 	d.newline = newlineFromConfig(d.props.EndOfLine, d.newline)
+	d.bom = bomFromConfig(d.props.Charset, d.bom)
+}
+
+// bomFromConfig applies an EditorConfig charset to the file's BOM; other
+// charsets and an unset value keep what the file had.
+func bomFromConfig(charset string, current bool) bool {
+	switch charset {
+	case "utf-8-bom":
+		return true
+	case "utf-8":
+		return false
+	}
+	return current
 }
 
 func (d *editorDocument) save(path string) { d.saveThen(path, nil) }
 
 func (d *editorDocument) saveThen(path string, after func(bool)) {
+	if d.loading {
+		// The buffer holds only part of the file until loading finishes.
+		d.window.toast("Wait for the document to finish loading")
+		if after != nil {
+			after(false)
+		}
+		return
+	}
 	if path != d.path {
 		go func() {
 			props, err := editorconfig.Resolve(path)
@@ -469,15 +603,15 @@ func (d *editorDocument) saveThen(path string, after func(bool)) {
 func (d *editorDocument) queueSave(path string, props editorconfig.Properties, after func(bool)) {
 	start, end := d.buffer.Bounds()
 	text := []byte(d.buffer.Text(start, end, true))
-	prepared := document.PrepareSave(text, boolOr(props.TrimTrailingWhitespace, false), boolOr(props.InsertFinalNewline, false))
 	newline := newlineFromConfig(props.EndOfLine, d.newline)
+	bom := bomFromConfig(props.Charset, d.bom)
 	expectedModTime := int64(0)
 	if path == d.path {
 		expectedModTime = d.modTime
 	}
 	d.saveQueue = append(d.saveQueue, &saveRequest{
-		path: path, text: text, prepared: prepared,
-		newline: newline, mode: d.mode, props: props, expectedModTime: expectedModTime,
+		path: path, text: text,
+		newline: newline, bom: bom, mode: d.mode, props: props, expectedModTime: expectedModTime,
 		revision: d.revision, cursor: d.buffer.IterAtMark(d.buffer.GetInsert()).Offset(),
 		after: after,
 	})
@@ -494,6 +628,8 @@ func (d *editorDocument) runNextSave() {
 	d.page.SetLoading(true)
 	operation := d.window.activityHub.Begin(activity.File, "Saving "+filepath.Base(request.path))
 	go func() {
+		request.prepared = document.PrepareSave(request.text,
+			boolOr(request.props.TrimTrailingWhitespace, false), boolOr(request.props.InsertFinalNewline, false))
 		modTime, err := d.window.saveFile(request)
 		dispatch.Main(func() {
 			d.saveRunning = false
@@ -535,12 +671,7 @@ func (d *editorDocument) runNextSave() {
 			savedCurrentRevision := d.revision == request.revision
 			if savedCurrentRevision {
 				if !bytes.Equal(request.text, request.prepared) {
-					d.loading = true
-					d.buffer.BeginUserAction()
-					d.buffer.SetText(string(request.prepared))
-					d.buffer.PlaceCursor(d.buffer.IterAtOffset(min(request.cursor, d.buffer.CharCount())))
-					d.buffer.EndUserAction()
-					d.loading = false
+					d.applySaveCleanup(request.text, request.prepared)
 				}
 				d.buffer.SetModified(false)
 			}
@@ -562,6 +693,33 @@ func (d *editorDocument) runNextSave() {
 			d.runNextSave()
 		})
 	}()
+}
+
+// applySaveCleanup brings the buffer in line with the saved text as small
+// edits, so undo, LSP, search, and branding see each change. PrepareSave only
+// removes trailing spaces and tabs per line and may add a final newline.
+func (d *editorDocument) applySaveCleanup(text, prepared []byte) {
+	type cut struct{ start, end int }
+	var cuts []cut
+	offset := 0
+	savedLines := bytes.Split(prepared, []byte("\n"))
+	for index, line := range bytes.Split(text, []byte("\n")) {
+		length := utf8.RuneCount(line)
+		if index < len(savedLines) && len(savedLines[index]) < len(line) {
+			cuts = append(cuts, cut{offset + utf8.RuneCount(savedLines[index]), offset + length})
+		}
+		offset += length + 1
+	}
+	d.buffer.BeginUserAction()
+	defer d.buffer.EndUserAction()
+	for index := len(cuts) - 1; index >= 0; index-- {
+		d.buffer.Delete(d.buffer.IterAtOffset(cuts[index].start), d.buffer.IterAtOffset(cuts[index].end))
+	}
+	if len(prepared) > 0 && prepared[len(prepared)-1] == '\n' {
+		if end := d.buffer.EndIter(); !end.BackwardChar() || end.Char() != '\n' {
+			d.buffer.Insert(d.buffer.EndIter(), "\n")
+		}
+	}
 }
 
 func (d *editorDocument) changePath(path string) {
@@ -620,12 +778,19 @@ func (d *editorDocument) confirmOverwrite(request *saveRequest) {
 }
 
 func (d *editorDocument) snapshot() document.Snapshot {
-	start, end := d.buffer.Bounds()
-	cursor := d.buffer.IterAtMark(d.buffer.GetInsert()).Offset()
-	return document.Snapshot{
-		ID: d.id, Path: d.path, Title: d.title(), Text: []byte(d.buffer.Text(start, end, true)),
-		Modified: d.buffer.Modified(), Cursor: cursor, Newline: d.newline,
+	if d.loading && d.pending != nil {
+		return *d.pending
 	}
+	snapshot := document.Snapshot{
+		ID: d.id, Path: d.path, Title: d.title(), Modified: d.buffer.Modified(),
+		Cursor: d.buffer.IterAtMark(d.buffer.GetInsert()).Offset(), Newline: d.newline, ModTime: d.modTime,
+	}
+	// SaveSession writes text only for unsaved or untitled documents.
+	if snapshot.Modified || snapshot.Path == "" {
+		start, end := d.buffer.Bounds()
+		snapshot.Text = []byte(d.buffer.Text(start, end, true))
+	}
+	return snapshot
 }
 
 func (d *editorDocument) scheduleCompletion() {
@@ -634,13 +799,6 @@ func (d *editorDocument) scheduleCompletion() {
 	}
 	if d.completionTimer != nil {
 		d.completionTimer.Stop()
-	}
-	if d.transformCancel != nil {
-		d.transformCancel()
-		d.transformCancel = nil
-	}
-	if d.search != nil && d.search.timer != nil {
-		d.search.timer.Stop()
 	}
 	d.completionGen++
 	gen := d.completionGen
@@ -657,36 +815,36 @@ func (d *editorDocument) scheduleCompletion() {
 func (d *editorDocument) requestCompletion(manual bool) {
 	logging.Trace("ui: completion requested", "manual", manual, "configured", d.window.completer != nil,
 		"automatic", d.window.options.Config.AI.Enabled, "consented", d.window.options.Config.AI.Consented)
-	operation := d.window.activityHub.Begin(activity.AI, "Generating suggestion")
-	if d.window.completer == nil {
-		operation.Fail(fmt.Errorf("no AI autocomplete models are configured"))
-		return
+	// Cheap checks run before the activity starts, so automatic requests that
+	// send nothing do not flash in the status bar. Only manual ones report why.
+	skip := func(reason string) {
+		if manual {
+			d.window.activityHub.Begin(activity.AI, "Generating suggestion").Fail(errors.New(reason))
+		}
 	}
 	if d.closed {
-		operation.Cancel()
+		return
+	}
+	if d.window.completer == nil {
+		skip("no AI autocomplete models are configured")
 		return
 	}
 	if d.loading {
-		operation.Fail(fmt.Errorf("document is still loading"))
+		skip("document is still loading")
 		return
 	}
 	if _, _, selected := d.buffer.SelectionBounds(); selected {
-		operation.Fail(fmt.Errorf("move the caret to request a suggestion"))
+		skip("move the caret to request a suggestion")
 		return
 	}
 	cursor := d.buffer.IterAtMark(d.buffer.GetInsert())
 	offset := cursor.Offset()
 	if !manual && offset == 0 {
-		operation.Cancel()
 		return
 	}
 	// Suggestions are drawn only beside the caret at a line end.
 	if !cursor.EndsLine() {
-		if manual {
-			operation.Fail(fmt.Errorf("move the caret to the end of a line"))
-		} else {
-			operation.Cancel()
-		}
+		skip("move the caret to the end of a line")
 		return
 	}
 	maxPrefix := d.window.options.Config.AI.PrefixSize
@@ -698,9 +856,9 @@ func (d *editorDocument) requestCompletion(manual bool) {
 		Filename: filepath.Base(d.path), Language: languageForPath(d.path),
 	}
 	if strings.TrimSpace(req.Prefix) == "" && !manual {
-		operation.Cancel()
 		return
 	}
+	operation := d.window.activityHub.Begin(activity.AI, "Generating suggestion")
 	if d.completionCancel != nil {
 		d.completionCancel()
 	}
@@ -712,11 +870,14 @@ func (d *editorDocument) requestCompletion(manual bool) {
 	requestedAt := time.Now()
 	go func() {
 		completion, err := completer.CompleteDetailed(ctx, req)
+		if errors.Is(err, context.Canceled) {
+			// Typing cancelled it; that is not a failure.
+			operation.Cancel()
+			return
+		}
 		if err != nil {
 			operation.Fail(err)
-			if !errors.Is(err, context.Canceled) {
-				slog.Debug("AI completion", "duration", time.Since(requestedAt), "err", err)
-			}
+			slog.Debug("AI completion", "duration", time.Since(requestedAt), "err", err)
 			return
 		}
 		logging.Trace("ui: completion returned", "model", completion.Model, "characters", utf8.RuneCountInString(completion.Text),
@@ -776,8 +937,41 @@ func (d *editorDocument) dismissCompletion() {
 	}
 }
 
+// continueCompletion keeps a suggestion while the user types the text it
+// predicted: the rest is shown at once, with no new request.
+func (d *editorDocument) continueCompletion() bool {
+	typed := d.typedThrough
+	d.typedThrough = ""
+	if typed == "" || d.ghostText == "" {
+		return false
+	}
+	rest := strings.TrimPrefix(d.completionText, typed)
+	offset := d.ghostOffset + utf8.RuneCountInString(typed)
+	d.dismissCompletion()
+	if rest == "" || d.buffer.IterAtMark(d.buffer.GetInsert()).Offset() != offset {
+		// Fully typed or moved away: request a fresh suggestion as usual.
+		return false
+	}
+	d.showCompletion(rest, offset)
+	return d.ghostText != ""
+}
+
 func (d *editorDocument) acceptCompletion(oneWord bool) {
 	text := d.completionText
+	if oneWord && d.replaceEnd == d.replaceStart {
+		// Insert the next word in place; continueCompletion keeps the rest
+		// of the suggestion visible.
+		word := completionWord(text)
+		if word == "" {
+			return
+		}
+		start := d.replaceStart
+		d.buffer.BeginUserAction()
+		d.buffer.Insert(d.buffer.IterAtOffset(start), word)
+		d.buffer.EndUserAction()
+		d.applyBrandRange(start-1, start+utf8.RuneCountInString(word)+1)
+		return
+	}
 	if oneWord {
 		if d.replaceEnd > d.replaceStart {
 			existing := d.buffer.Text(d.buffer.IterAtOffset(d.replaceStart), d.buffer.IterAtOffset(d.replaceEnd), true)
@@ -908,28 +1102,43 @@ func (d *editorDocument) requestLSPCompletion() {
 	iter := d.buffer.IterAtMark(d.buffer.GetInsert())
 	position := d.lspPosition(iter)
 	offset := iter.Offset()
+	word := d.wordBeforeCaret(iter)
+	// A new request replaces any pending AI or LSP suggestion request.
+	d.dismissCompletion()
+	gen := d.completionGen
 	ctx, cancel := context.WithTimeout(d.window.ctx, 2*time.Second)
+	d.completionCancel = cancel
+	client, uri := d.lspClient, d.lspURI
 	go func() {
 		defer cancel()
-		items, err := d.lspClient.Completions(ctx, d.lspURI, position)
+		items, err := client.Completions(ctx, uri, position)
 		if err != nil {
 			slog.Debug("LSP completion", "err", err)
 			return
 		}
-		if len(items) == 0 {
+		item, ok := bestCompletion(items, word)
+		if !ok {
 			return
 		}
-		item := items[0]
 		dispatch.Main(func() {
-			if d.closed || d.buffer.IterAtMark(d.buffer.GetInsert()).Offset() != offset {
+			if d.closed || gen != d.completionGen || d.buffer.IterAtMark(d.buffer.GetInsert()).Offset() != offset {
 				return
 			}
 			if !d.buffer.IterAtOffset(offset).EndsLine() {
 				d.window.toast("Completions show only at the end of a line")
 				return
 			}
-			display, insertion := item.InsertText, item.InsertText
+			insertion := item.InsertText
+			if insertion == "" {
+				insertion = item.Label
+			}
+			display := insertion
 			start, end := offset, offset
+			if word != "" && strings.HasPrefix(insertion, word) {
+				// The server returned the whole word; replace what is typed.
+				start = offset - utf8.RuneCountInString(word)
+				display = strings.TrimPrefix(insertion, word)
+			}
 			if item.TextEdit != nil {
 				var ok bool
 				start, ok = d.offsetForLSPPosition(item.TextEdit.Range.Start)
@@ -950,6 +1159,36 @@ func (d *editorDocument) requestLSPCompletion() {
 			d.showCompletionEdit(display, insertion, offset, start, end)
 		})
 	}()
+}
+
+// wordBeforeCaret returns the identifier characters right before iter.
+func (d *editorDocument) wordBeforeCaret(iter *gtk.TextIter) string {
+	start := iter.Copy()
+	for {
+		previous := start.Copy()
+		if !previous.BackwardChar() || !isIdentifierRune(rune(previous.Char())) {
+			break
+		}
+		start = previous
+	}
+	return d.buffer.Text(start, iter, true)
+}
+
+// bestCompletion picks the first item, in server order, whose filter text
+// starts with the typed word, ignoring case. Servers often return items that
+// do not match what is typed.
+func bestCompletion(items []lsp.Completion, word string) (lsp.Completion, bool) {
+	lowered := strings.ToLower(word)
+	for _, item := range items {
+		key := item.FilterText
+		if key == "" {
+			key = item.Label
+		}
+		if strings.HasPrefix(strings.ToLower(key), lowered) {
+			return item, true
+		}
+	}
+	return lsp.Completion{}, false
 }
 
 func (d *editorDocument) offsetForLSPPosition(position lsp.Position) (int, bool) {
@@ -1008,11 +1247,15 @@ func (d *editorDocument) stopLSP() {
 	if session != nil {
 		delete(session.docs, d)
 		if len(session.docs) == 0 {
+			// Close asks the server to exit and reaps the process; cancel is
+			// the hard stop if it does not.
+			session.client.Close()
 			session.cancel()
 			delete(d.window.lspSessions, session.key)
 		}
 	}
 	d.lspClient = nil
+	d.lspURI = ""
 	d.lspSession = ""
 	d.lspReady = false
 	d.lspOpening = false
@@ -1030,20 +1273,31 @@ func (d *editorDocument) startExternalWatch() {
 			return false
 		}
 		path, modTime := d.path, d.modTime
+		if d.diskWarn || d.loading || d.saveRunning {
+			return true
+		}
 		go func() {
 			changed, err := document.ChangedOnDisk(path, modTime)
+			exists := pathExists(path)
 			dispatch.Main(func() {
-				if d.closed || path != d.path || modTime != d.modTime {
+				if d.closed || path != d.path || modTime != d.modTime || d.diskWarn || d.loading || d.saveRunning {
 					return
 				}
 				if err != nil {
 					slog.Debug("check external document change", "path", path, "err", err)
 					return
 				}
-				if changed && !d.diskWarn {
-					d.diskWarn = true
-					d.window.toast(filepath.Base(path) + " changed on disk")
+				if !changed {
+					return
 				}
+				if exists && !d.buffer.Modified() {
+					// Nothing unsaved can be lost, so follow the file on disk.
+					d.stopLSP()
+					d.load(path, d.buffer.IterAtMark(d.buffer.GetInsert()).Offset())
+					return
+				}
+				d.diskWarn = true
+				d.window.toast(filepath.Base(path) + " changed on disk")
 			})
 		}()
 		return true
@@ -1055,8 +1309,15 @@ func (d *editorDocument) lspPosition(iter *gtk.TextIter) lsp.Position {
 	if !ok {
 		return lsp.Position{Line: iter.Line(), Character: iter.LineOffset()}
 	}
-	text := d.buffer.Text(lineStart, iter, true)
-	return lsp.Position{Line: iter.Line(), Character: len(utf16.Encode([]rune(text)))}
+	// UTF-16 length is the character count plus one per rune outside the
+	// BMP, which are exactly the 4-byte UTF-8 sequences.
+	units := iter.LineOffset()
+	for _, b := range []byte(d.buffer.Text(lineStart, iter, true)) {
+		if b >= 0xf0 {
+			units++
+		}
+	}
+	return lsp.Position{Line: iter.Line(), Character: units}
 }
 
 func (d *editorDocument) close() {

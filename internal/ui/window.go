@@ -45,6 +45,7 @@ type window struct {
 	sidebarToggle       *gtk.Button
 	sidebarWidth        int
 	projectRoot         string
+	projectTree         *projectTree
 	pendingCtrlK        bool
 	ctrlKTimer          glib.SourceHandle
 	preferences         *adw.PreferencesDialog
@@ -56,8 +57,19 @@ type window struct {
 	completer   *ai.Completer
 	aiCancel    context.CancelFunc
 	restored    bool
-	mu          sync.Mutex
+
+	// Session writes run in the background; sessionMu orders them and
+	// sessionWritten drops a write that is older than one already on disk.
+	sessionMu      sync.Mutex
+	sessionSeq     uint64
+	sessionWritten uint64
+	sessionTimer   glib.SourceHandle
+	sessionClosed  bool
+	forceClose     bool
 }
+
+// sessionSaveDelaySeconds bounds how much unsaved text a crash can lose.
+const sessionSaveDelaySeconds = 5
 
 func newWindow(app *adw.Application, options Options) *window {
 	ctx, cancel := context.WithCancel(context.Background())
@@ -68,9 +80,9 @@ func newWindow(app *adw.Application, options Options) *window {
 	}
 	w.saveFile = func(request *saveRequest) (int64, error) {
 		if request.force || request.expectedModTime == 0 {
-			return document.Save(request.path, request.prepared, request.newline, request.mode)
+			return document.Save(request.path, request.prepared, request.newline, request.bom, request.mode)
 		}
-		return document.SaveChecked(request.path, request.prepared, request.newline, request.mode, request.expectedModTime)
+		return document.SaveChecked(request.path, request.prepared, request.newline, request.bom, request.mode, request.expectedModTime)
 	}
 	w.build()
 	w.registerActions()
@@ -233,7 +245,14 @@ func (w *window) build() {
 	w.toastOverlay.SetChild(toolbar)
 	w.win.SetContent(w.toastOverlay)
 	w.win.ConnectCloseRequest(func() bool {
-		w.persistSession()
+		if w.forceClose {
+			return false
+		}
+		if err := w.persistSession(true); err != nil {
+			w.confirmCloseWithoutSession(err)
+			return true
+		}
+		w.sessionClosed = true
 		return false
 	})
 	logging.Trace("ui: window shell ready")
@@ -245,7 +264,16 @@ func (w *window) registerActions() {
 	w.action("open", w.chooseOpen, "<Control>o")
 	w.action("command-palette", w.showCommandPalette, "<Control><Shift>p")
 	w.action("quick-open", w.showQuickOpen, "<Control>p")
-	w.action("save", w.saveActive, "<Control>s")
+	w.action("save", func() {
+		// Application accelerators can run before the window key handler, so
+		// finish the Ctrl+K Ctrl+S chord here as well.
+		if w.pendingCtrlK {
+			w.clearPendingChord()
+			w.showShortcuts()
+			return
+		}
+		w.saveActive()
+	}, "<Control>s")
 	w.action("save-as", w.saveActiveAs, "<Control><Shift>s")
 	w.action("find", func() { w.showSearch(false) }, "<Control>f")
 	w.action("replace", func() { w.showSearch(true) }, "<Control>h")
@@ -255,16 +283,19 @@ func (w *window) registerActions() {
 		}
 	}, "<Control><Shift>v")
 	w.action("ai-transform", w.showAITransform)
+	// Undo and redo have no application accelerators: the source view binds
+	// Ctrl+Z and Ctrl+Shift+Z itself, and global accelerators would steal
+	// them from the search, replace, and palette entries.
 	w.action("undo", func() {
 		if doc := w.active(); doc != nil && doc.buffer.CanUndo() {
 			doc.buffer.Undo()
 		}
-	}, "<Control>z")
+	})
 	w.action("redo", func() {
 		if doc := w.active(); doc != nil && doc.buffer.CanRedo() {
 			doc.buffer.Redo()
 		}
-	}, "<Control><Shift>z", "<Control>y")
+	})
 	w.action("toggle-sidebar", w.toggleSidebar, "<Control>b")
 	w.action("show-sidebar", func() {
 		w.showSidebar()
@@ -451,7 +482,11 @@ func (w *window) selectRelativeTab(direction int) {
 func (w *window) present() { w.win.Present() }
 
 func (w *window) stop() {
-	w.persistSession()
+	if !w.sessionClosed {
+		if err := w.persistSession(true); err != nil {
+			slog.Warn("save session", "err", err)
+		}
+	}
 	w.cancel()
 	if w.activity != nil {
 		w.activity.destroy()
@@ -476,8 +511,18 @@ func (w *window) setCompleter(completer *ai.Completer) {
 }
 
 func (w *window) restoreOrNew() {
+	w.restoreSession()
+	if len(w.documents) == 0 {
+		w.newDocument(nil)
+	}
+}
+
+// restoreSession reopens the previous tabs once per window. Opening files
+// from the command line must restore first, or the next session save would
+// delete the old recovery copies.
+func (w *window) restoreSession() {
 	logging.Trace("ui: restore session")
-	if w.restored || len(w.documents) > 0 {
+	if w.restored {
 		return
 	}
 	w.restored = true
@@ -496,9 +541,6 @@ func (w *window) restoreOrNew() {
 	}
 	if activePage != nil {
 		w.tabs.SetSelectedPage(activePage)
-	}
-	if len(w.documents) == 0 {
-		w.newDocument(nil)
 	}
 	logging.Trace("ui: session ready", "documents", len(w.documents))
 }
@@ -567,12 +609,15 @@ func (w *window) openPath(path string) {
 		return
 	}
 	doc := w.newDocument(nil)
-	doc.load(path)
+	doc.load(path, 0)
 }
 
 func (w *window) chooseOpen() {
 	dialog := gtk.NewFileDialog()
 	dialog.SetTitle("Open File")
+	if folder := w.dialogFolder(); folder != "" {
+		dialog.SetInitialFolder(gio.NewFileForPath(folder))
+	}
 	dialog.OpenMultipleTextFiles(w.ctx, &w.win.Window, func(result gio.AsyncResulter) {
 		_, files, err := dialog.OpenMultipleTextFilesFinish(result)
 		if err != nil || files == nil {
@@ -588,6 +633,15 @@ func (w *window) chooseOpen() {
 			}
 		}
 	})
+}
+
+// dialogFolder is where file dialogs start: the active file's folder, else
+// the project folder.
+func (w *window) dialogFolder() string {
+	if doc := w.active(); doc != nil && doc.path != "" {
+		return filepath.Dir(doc.path)
+	}
+	return w.projectRoot
 }
 
 func (w *window) saveActive() {
@@ -613,7 +667,14 @@ func (w *window) saveDocumentAs(doc *editorDocument) {
 func (w *window) saveDocumentAsThen(doc *editorDocument, after func(bool)) {
 	dialog := gtk.NewFileDialog()
 	dialog.SetTitle("Save Document")
-	dialog.SetInitialName(doc.title())
+	if doc.path != "" {
+		dialog.SetInitialFile(gio.NewFileForPath(doc.path))
+	} else {
+		if folder := w.dialogFolder(); folder != "" {
+			dialog.SetInitialFolder(gio.NewFileForPath(folder))
+		}
+		dialog.SetInitialName(doc.title())
+	}
 	dialog.SaveTextFile(w.ctx, &w.win.Window, func(result gio.AsyncResulter) {
 		_, _, file, err := dialog.SaveTextFileFinish(result)
 		if err != nil || file == nil {
@@ -640,6 +701,19 @@ func (w *window) closePage(page *adw.TabPage) bool {
 		if close && len(w.documents) == 0 {
 			w.newDocument(nil)
 		}
+		if close {
+			w.scheduleSessionSave()
+		}
+	}
+	if doc.loading {
+		if doc.pending != nil && doc.pending.Modified {
+			// Recovered text is not in the buffer yet, so it cannot be saved.
+			w.toast("Wait for the document to finish loading")
+			finish(false)
+			return true
+		}
+		finish(true)
+		return true
 	}
 	if !doc.buffer.Modified() {
 		finish(true)
@@ -704,21 +778,77 @@ func (w *window) updateTitle(doc *editorDocument) {
 	w.title.SetSubtitle(subtitle)
 }
 
-func (w *window) persistSession() {
-	w.mu.Lock()
-	defer w.mu.Unlock()
+// persistSession saves the open tabs and recovery copies. Snapshots are taken
+// on the GTK thread. The write runs in the background unless wait is set; only
+// a waiting call reports its error.
+func (w *window) persistSession(wait bool) error {
+	if w.sessionTimer != 0 {
+		glib.SourceRemove(w.sessionTimer)
+		w.sessionTimer = 0
+	}
 	snapshots := make([]document.Snapshot, 0, len(w.documents))
 	for index := 0; index < w.tabs.NPages(); index++ {
 		page := w.tabs.NthPage(index)
-		if doc := w.documentForPage(page); doc != nil && !doc.loading {
+		if doc := w.documentForPage(page); doc != nil {
 			snapshot := doc.snapshot()
 			snapshot.Active = sameTabPage(page, w.tabs.SelectedPage())
 			snapshots = append(snapshots, snapshot)
 		}
 	}
-	if err := document.SaveSession(w.options.Paths.StateDir, snapshots); err != nil {
-		slog.Warn("save session", "err", err)
+	w.sessionSeq++
+	sequence, stateDir := w.sessionSeq, w.options.Paths.StateDir
+	write := func() error {
+		w.sessionMu.Lock()
+		defer w.sessionMu.Unlock()
+		if sequence <= w.sessionWritten {
+			return nil
+		}
+		err := document.SaveSession(stateDir, snapshots)
+		if err == nil {
+			w.sessionWritten = sequence
+		}
+		return err
 	}
+	if wait {
+		return write()
+	}
+	go func() {
+		if err := write(); err != nil {
+			slog.Warn("save session", "err", err)
+		}
+	}()
+	return nil
+}
+
+// scheduleSessionSave writes the session a few seconds after an edit, so a
+// crash or logout loses at most that much unsaved text.
+func (w *window) scheduleSessionSave() {
+	if w.sessionTimer != 0 || w.sessionClosed {
+		return
+	}
+	w.sessionTimer = glib.TimeoutSecondsAdd(sessionSaveDelaySeconds, func() bool {
+		w.sessionTimer = 0
+		_ = w.persistSession(false)
+		return false
+	})
+}
+
+func (w *window) confirmCloseWithoutSession(err error) {
+	slog.Warn("save session", "err", err)
+	dialog := adw.NewAlertDialog("Couldn’t save the session",
+		"Unsaved documents can’t be recovered after closing. "+err.Error())
+	dialog.AddResponse("cancel", "Cancel")
+	dialog.AddResponse("close", "Close Anyway")
+	dialog.SetCloseResponse("cancel")
+	dialog.SetDefaultResponse("cancel")
+	dialog.SetResponseAppearance("close", adw.ResponseDestructive)
+	dialog.ConnectResponse(func(response string) {
+		if response == "close" {
+			w.forceClose = true
+			w.win.Close()
+		}
+	})
+	dialog.Present(w.win)
 }
 
 func loadCSS() {
@@ -727,7 +857,6 @@ func loadCSS() {
 .editor { font-family: monospace; font-size: 11pt; }
 .inline-completion { font-family: monospace; font-size: 11pt; }
 .search-count { min-width: 5em; }
-.secondary-caret { color: @accent_color; font-weight: bold; }
 .project-tree { padding: 4px; }
 .project-entry-row { border-radius: 6px; }
 .project-entry-open { padding: 5px 7px; border-radius: 6px; }
@@ -807,8 +936,30 @@ func (w *window) showAbout() {
 
 func (w *window) showShortcuts() {
 	w.showPalette("Keyboard Shortcuts", "Search shortcuts", func(deliver func([]paletteItem)) {
-		deliver(w.commandPaletteItems())
+		deliver(append(w.commandPaletteItems(), editingShortcutItems()...))
 	})
+}
+
+// editingShortcutItems lists keys that act inside the editor and have no
+// command. Choosing one only closes the list.
+func editingShortcutItems() []paletteItem {
+	hints := []struct{ title, shortcut string }{
+		{"Multiple Cursors: Add Cursor Above / Below", "Ctrl+Shift+Up/Down"},
+		{"Multiple Cursors: Add or Remove Cursor", "Alt+Click"},
+		{"Multiple Cursors: Column Selection", "Shift+Alt+Drag"},
+		{"Multiple Cursors: Remove Last Cursor", "Ctrl+U"},
+		{"Multiple Cursors: Back to One Cursor", "Escape"},
+		{"Suggestion: Accept", "Tab"},
+		{"Suggestion: Accept Next Word", "Ctrl+Right"},
+		{"Suggestion: Dismiss", "Escape"},
+		{"Edit: Redo", "Ctrl+Shift+Z / Ctrl+Y"},
+		{"Help: Keyboard Shortcuts", "Ctrl+K Ctrl+S"},
+	}
+	items := make([]paletteItem, len(hints))
+	for i, hint := range hints {
+		items[i] = paletteItem{title: hint.title, shortcut: hint.shortcut, run: func() {}}
+	}
+	return items
 }
 
 func (w *window) openPreferences() {

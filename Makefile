@@ -22,9 +22,10 @@ endif
 test:
 	go test $(PKG)
 
+# GTK tests run in a headless Wayland session; E_TEST_VISIBLE=1 shows them.
 test-ui:
-	E_UI_RUNTIME_TEST=1 go test ./internal/ui -run TestEditorRuntimeSmoke -count=1
-	E_PREVIEW_RUNTIME_TEST=1 go test ./internal/markdownpreview -run TestWebKitRuntime -count=1
+	E_UI_RUNTIME_TEST=1 scripts/headless.sh go test ./internal/ui -run 'TestEditorRuntimeSmoke|TestProjectTreeRuntime' -count=1
+	E_PREVIEW_RUNTIME_TEST=1 scripts/headless.sh go test ./internal/markdownpreview -run TestWebKitRuntime -count=1
 
 vet:
 	go vet $(PKG)

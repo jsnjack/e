@@ -27,11 +27,13 @@ const (
 type KeyFunc func(provider, endpoint string) string
 
 type openAIProvider struct {
-	client  *http.Client
-	model   config.Model
-	apiKey  string
-	keyFor  KeyFunc
-	keyOnce sync.Once
+	client *http.Client
+	model  config.Model
+	keyFor KeyFunc
+	// keyMu guards apiKey. Only a non-empty key is cached, so a keyring that
+	// was locked at the first lookup is asked again on the next request.
+	keyMu  sync.Mutex
+	apiKey string
 }
 
 var configuredUserAgent atomic.Value
@@ -94,7 +96,9 @@ func (p *openAIProvider) Healthy(ctx context.Context) error {
 	if _, err := io.Copy(io.Discard, io.LimitReader(resp.Body, 4096)); err != nil {
 		return fmt.Errorf("read availability response: %w", err)
 	}
-	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+	// Some servers do not implement /models (404, 405) yet serve completions.
+	// Only rejected credentials and server errors mean the model is unusable.
+	if resp.StatusCode == http.StatusUnauthorized || resp.StatusCode == http.StatusForbidden || resp.StatusCode >= 500 {
 		return fmt.Errorf("availability returned %s", resp.Status)
 	}
 	return nil
@@ -169,6 +173,7 @@ func (p *openAIProvider) Complete(ctx context.Context, request Request) (string,
 			Message struct {
 				Content string `json:"content"`
 			} `json:"message"`
+			FinishReason string `json:"finish_reason"`
 		} `json:"choices"`
 	}
 	if err := json.Unmarshal(data, &decoded); err != nil {
@@ -177,21 +182,47 @@ func (p *openAIProvider) Complete(ctx context.Context, request Request) (string,
 	if len(decoded.Choices) == 0 {
 		return "", fmt.Errorf("completion contained no choices")
 	}
-	if decoded.Choices[0].Text != "" {
-		return decoded.Choices[0].Text, nil
+	choice := decoded.Choices[0]
+	text := choice.Text
+	if text == "" {
+		text = choice.Message.Content
 	}
-	return decoded.Choices[0].Message.Content, nil
+	if choice.FinishReason == "length" {
+		if request.Instruction != "" {
+			return "", fmt.Errorf("replacement was cut off at the model's token limit")
+		}
+		text = dropPartialLine(text)
+	}
+	return text, nil
+}
+
+// dropPartialLine cuts a token-limited completion back to its last complete
+// line, so a suggestion never ends mid-identifier. It returns "" when the
+// text has no complete line.
+func dropPartialLine(text string) string {
+	end := strings.LastIndexByte(text, '\n')
+	if end < 0 {
+		return ""
+	}
+	return text[:end]
 }
 
 func (p *openAIProvider) authorize(req *http.Request) {
-	p.keyOnce.Do(func() {
-		if p.keyFor != nil && !endpointIsLoopback(p.model.Endpoint) {
-			p.apiKey = p.keyFor(p.model.Provider, p.model.Endpoint)
-		}
-	})
-	if p.apiKey != "" {
-		req.Header.Set("Authorization", "Bearer "+p.apiKey)
+	if key := p.key(); key != "" {
+		req.Header.Set("Authorization", "Bearer "+key)
 	}
+}
+
+func (p *openAIProvider) key() string {
+	if p.keyFor == nil || endpointIsLoopback(p.model.Endpoint) {
+		return ""
+	}
+	p.keyMu.Lock()
+	defer p.keyMu.Unlock()
+	if p.apiKey == "" {
+		p.apiKey = p.keyFor(p.model.Provider, p.model.Endpoint)
+	}
+	return p.apiKey
 }
 
 func endpointIsLoopback(endpoint string) bool {

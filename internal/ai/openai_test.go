@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 
@@ -151,5 +152,110 @@ func TestCompletionTimeoutAllowsLocalColdStart(t *testing.T) {
 	}
 	if got := completionTimeout("https://example.com/v1"); got != remoteCompletionTimeout {
 		t.Fatalf("remote timeout = %v, want %v", got, remoteCompletionTimeout)
+	}
+}
+
+func TestTokenLimitDropsPartialLine(t *testing.T) {
+	tests := []struct {
+		name     string
+		protocol string
+		request  Request
+		body     string
+		want     string
+		wantErr  bool
+	}{
+		{name: "chat cut mid-line", protocol: "chat", request: Request{Prefix: "a"}, body: `{"choices":[{"message":{"content":"one()\ntwo()\nthr"},"finish_reason":"length"}]}`, want: "one()\ntwo()"},
+		{name: "chat cut without newline", protocol: "chat", request: Request{Prefix: "a"}, body: `{"choices":[{"message":{"content":"partialIdent"},"finish_reason":"length"}]}`, want: ""},
+		{name: "fim cut mid-line", protocol: "fim-qwen", request: Request{Prefix: "a"}, body: `{"choices":[{"text":"x := 1\ny := comp","finish_reason":"length"}]}`, want: "x := 1"},
+		{name: "fim stopped normally", protocol: "fim-qwen", request: Request{Prefix: "a"}, body: `{"choices":[{"text":"x := 1\ny","finish_reason":"stop"}]}`, want: "x := 1\ny"},
+		{name: "transform cut is an error", protocol: "chat", request: Request{Instruction: "fix", Selection: "s"}, body: `{"choices":[{"message":{"content":"a\nb"},"finish_reason":"length"}]}`, wantErr: true},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, _ *http.Request) {
+				writer.Header().Set("Content-Type", "application/json")
+				if _, err := fmt.Fprint(writer, test.body); err != nil {
+					t.Errorf("write response: %v", err)
+				}
+			}))
+			defer server.Close()
+			providers, err := NewProviders([]config.Model{{
+				Name: "test", Provider: "openai", Endpoint: server.URL + "/v1", Protocol: test.protocol,
+			}}, nil)
+			if err != nil {
+				t.Fatal(err)
+			}
+			got, err := providers[0].Complete(context.Background(), test.request)
+			if (err != nil) != test.wantErr {
+				t.Fatalf("error = %v, wantErr %v", err, test.wantErr)
+			}
+			if got != test.want {
+				t.Fatalf("completion = %q, want %q", got, test.want)
+			}
+		})
+	}
+}
+
+func TestHealthyStatus(t *testing.T) {
+	tests := []struct {
+		status    int
+		wantError bool
+	}{
+		{status: http.StatusOK},
+		{status: http.StatusNotFound},
+		{status: http.StatusMethodNotAllowed},
+		{status: http.StatusUnauthorized, wantError: true},
+		{status: http.StatusForbidden, wantError: true},
+		{status: http.StatusInternalServerError, wantError: true},
+		{status: http.StatusServiceUnavailable, wantError: true},
+	}
+	for _, test := range tests {
+		t.Run(http.StatusText(test.status), func(t *testing.T) {
+			server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, _ *http.Request) {
+				writer.WriteHeader(test.status)
+			}))
+			defer server.Close()
+			providers, err := NewProviders([]config.Model{{Name: "test", Provider: "openai", Endpoint: server.URL + "/v1"}}, nil)
+			if err != nil {
+				t.Fatal(err)
+			}
+			err = providers[0].Healthy(context.Background())
+			if (err != nil) != test.wantError {
+				t.Fatalf("Healthy() = %v, wantError %v", err, test.wantError)
+			}
+		})
+	}
+}
+
+func TestEmptyKeyIsNotCached(t *testing.T) {
+	var lookups atomic.Int32
+	provider := &openAIProvider{
+		model: config.Model{Provider: "openai", Endpoint: "https://models.example/v1"},
+		keyFor: func(_, _ string) string {
+			// The keyring is locked for the first two lookups.
+			if lookups.Add(1) <= 2 {
+				return ""
+			}
+			return "secret"
+		},
+	}
+	var wg sync.WaitGroup
+	for range 2 {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			if key := provider.key(); key != "" {
+				t.Errorf("locked keyring returned %q", key)
+			}
+		}()
+	}
+	wg.Wait()
+	for range 3 {
+		if key := provider.key(); key != "secret" {
+			t.Fatalf("key = %q, want secret", key)
+		}
+	}
+	if got := lookups.Load(); got != 3 {
+		t.Fatalf("keyring looked up %d times, want 3", got)
 	}
 }

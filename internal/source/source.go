@@ -56,8 +56,16 @@ typedef struct {
   GdkRGBA color;
 } GhostText;
 
+// Secondary carets of multiple-cursor editing, as character offsets. They are
+// drawn in the same layer, so they match the primary caret and scroll with it.
+typedef struct {
+  int count;
+  int *offsets;
+} CaretSet;
+
 static GType ghost_view_type;
 static GQuark ghost_quark;
+static GQuark caret_quark;
 static void (*parent_snapshot_layer)(GtkTextView *, GtkTextViewLayer, GtkSnapshot *);
 
 static void ghost_free(gpointer data) {
@@ -66,9 +74,44 @@ static void ghost_free(gpointer data) {
   g_free(ghost);
 }
 
+static void caret_free(gpointer data) {
+  CaretSet *carets = data;
+  g_free(carets->offsets);
+  g_free(carets);
+}
+
+static void snapshot_carets(GtkTextView *view, GtkSnapshot *snapshot) {
+  CaretSet *carets = g_object_get_qdata(G_OBJECT(view), caret_quark);
+  if (!carets || carets->count == 0) return;
+  GtkTextBuffer *buffer = gtk_text_view_get_buffer(view);
+  GdkRectangle visible;
+  gtk_text_view_get_visible_rect(view, &visible);
+  // Only lines on screen are laid out; skip carets outside them so a caret
+  // far away never forces layout of its line.
+  GtkTextIter top, bottom;
+  gtk_text_view_get_iter_at_location(view, &top, visible.x, visible.y);
+  gtk_text_view_get_iter_at_location(view, &bottom, visible.x, visible.y + visible.height);
+  gtk_text_iter_set_line_offset(&top, 0);
+  gtk_text_iter_forward_to_line_end(&bottom);
+  int first = gtk_text_iter_get_offset(&top);
+  int last = gtk_text_iter_get_offset(&bottom);
+  GdkRGBA color;
+  gtk_widget_get_color(GTK_WIDGET(view), &color);
+  for (int i = 0; i < carets->count; i++) {
+    int offset = carets->offsets[i];
+    if (offset < first || offset > last) continue;
+    GtkTextIter iter;
+    gtk_text_buffer_get_iter_at_offset(buffer, &iter, offset);
+    GdkRectangle strong;
+    gtk_text_view_get_cursor_locations(view, &iter, &strong, NULL);
+    gtk_snapshot_append_color(snapshot, &color, &GRAPHENE_RECT_INIT(strong.x, strong.y, 1, strong.height));
+  }
+}
+
 static void ghost_snapshot_layer(GtkTextView *view, GtkTextViewLayer layer, GtkSnapshot *snapshot) {
   if (parent_snapshot_layer) parent_snapshot_layer(view, layer, snapshot);
   if (layer != GTK_TEXT_VIEW_LAYER_ABOVE_TEXT) return;
+  snapshot_carets(view, snapshot);
   GhostText *ghost = g_object_get_qdata(G_OBJECT(view), ghost_quark);
   if (!ghost || !ghost->layout) return;
   gtk_snapshot_save(snapshot);
@@ -91,6 +134,7 @@ static GType ghost_view_get_type(void) {
   g_type_query(parent_type(), &query);
   if (!query.type) return 0;
   ghost_quark = g_quark_from_static_string("e-ghost-text");
+  caret_quark = g_quark_from_static_string("e-secondary-carets");
   ghost_view_type = g_type_register_static_simple(parent_type(), "EGhostSourceView",
                                                   query.class_size, ghost_class_init,
                                                   query.instance_size, NULL, 0);
@@ -207,6 +251,19 @@ static GtkTextView *bridge_text_view(uintptr_t pointer) {
   return (GtkTextView *)pointer;
 }
 
+static gboolean bridge_set_carets(GtkTextView *view, const int *offsets, int count) {
+  if (!ghost_view_type || !G_TYPE_CHECK_INSTANCE_TYPE(view, ghost_view_type)) return FALSE;
+  CaretSet *carets = NULL;
+  if (count > 0) {
+    carets = g_new0(CaretSet, 1);
+    carets->count = count;
+    carets->offsets = g_memdup2(offsets, sizeof(int) * count);
+  }
+  g_object_set_qdata_full(G_OBJECT(view), caret_quark, carets, carets ? caret_free : NULL);
+  gtk_widget_queue_draw(GTK_WIDGET(view));
+  return TRUE;
+}
+
 static PangoLayout *bridge_layout(uintptr_t pointer) {
   return (PangoLayout *)pointer;
 }
@@ -297,6 +354,23 @@ func (v *View) SetGhost(layout *pango.Layout, x, y int, color *gdk.RGBA) bool {
 func (v *View) ClearGhost() {
 	C.bridge_set_ghost(v.native(), nil, 0, 0, 0, 0, 0, 0)
 	runtime.KeepAlive(v)
+}
+
+// SetCarets draws a secondary caret at each character offset. An empty slice
+// removes them. It reports false when the view cannot draw carets.
+func (v *View) SetCarets(offsets []int) bool {
+	var pointer *C.int
+	if len(offsets) > 0 {
+		native := make([]C.int, len(offsets))
+		for i, offset := range offsets {
+			native[i] = C.int(offset)
+		}
+		pointer = &native[0]
+		defer runtime.KeepAlive(native)
+	}
+	ok := C.bridge_set_carets(v.native(), pointer, C.int(len(offsets))) != 0
+	runtime.KeepAlive(v)
+	return ok
 }
 
 // Close releases native helper objects owned by this wrapper.

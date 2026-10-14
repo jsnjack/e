@@ -3,6 +3,7 @@ package ui
 import (
 	"context"
 	"log/slog"
+	"reflect"
 	"strconv"
 	"strings"
 	"time"
@@ -248,6 +249,10 @@ func (w *window) buildPreferences() *adw.PreferencesDialog {
 			if key := item.key.Text(); key != "" {
 				keys[model.Endpoint] = key
 			}
+		}
+		if reflect.DeepEqual(cfg, w.options.Config) && len(keys) == 0 && len(forgotten) == 0 {
+			// Nothing changed: keep the config file and the running models.
+			return
 		}
 		// Let AdwDialog finish removing its modal host before changing widgets in
 		// the parent window. Re-entering the editor tree from the closed signal

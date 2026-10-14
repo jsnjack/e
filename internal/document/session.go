@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log/slog"
 	"os"
 	"path/filepath"
 )
@@ -20,6 +21,7 @@ type Snapshot struct {
 	Cursor   int     `json:"cursor"`
 	Newline  Newline `json:"newline"`
 	Active   bool    `json:"active,omitempty"`
+	ModTime  int64   `json:"mod_time,omitempty"`
 }
 
 type sessionTab struct {
@@ -31,6 +33,7 @@ type sessionTab struct {
 	Cursor   int     `json:"cursor"`
 	Newline  Newline `json:"newline"`
 	Active   bool    `json:"active,omitempty"`
+	ModTime  int64   `json:"mod_time,omitempty"`
 }
 
 // SaveSession persists open tabs and recovery copies for unsaved content.
@@ -49,6 +52,7 @@ func SaveSession(stateDir string, snapshots []Snapshot) error {
 			ID: snapshot.ID, Path: snapshot.Path, Title: snapshot.Title,
 			Modified: snapshot.Modified, Cursor: snapshot.Cursor,
 			Newline: snapshot.Newline, Active: snapshot.Active,
+			ModTime: snapshot.ModTime,
 		}
 		if snapshot.Modified || snapshot.Path == "" {
 			tab.Recovery = filepath.Join("recovery", snapshot.ID+".txt")
@@ -60,6 +64,14 @@ func SaveSession(stateDir string, snapshots []Snapshot) error {
 		}
 		tabs = append(tabs, tab)
 	}
+	body, err := json.Marshal(tabs)
+	if err != nil {
+		return fmt.Errorf("encode session: %w", err)
+	}
+	if err := writeAtomic(filepath.Join(stateDir, sessionFilename), body, 0o600); err != nil {
+		return fmt.Errorf("save session: %w", err)
+	}
+	// Remove stale recovery files only after session.json stops naming them.
 	entries, err := os.ReadDir(recoveryDir)
 	if err != nil {
 		return fmt.Errorf("list recovery directory: %w", err)
@@ -71,13 +83,6 @@ func SaveSession(stateDir string, snapshots []Snapshot) error {
 				return fmt.Errorf("remove stale recovery %s: %w", path, err)
 			}
 		}
-	}
-	body, err := json.Marshal(tabs)
-	if err != nil {
-		return fmt.Errorf("encode session: %w", err)
-	}
-	if err := writeAtomic(filepath.Join(stateDir, sessionFilename), body, 0o600); err != nil {
-		return fmt.Errorf("save session: %w", err)
 	}
 	return nil
 }
@@ -101,6 +106,7 @@ func LoadSession(stateDir string) ([]Snapshot, error) {
 			ID: tab.ID, Path: tab.Path, Title: tab.Title,
 			Modified: tab.Modified, Cursor: tab.Cursor,
 			Newline: tab.Newline, Active: tab.Active,
+			ModTime: tab.ModTime,
 		}
 		if tab.Recovery != "" {
 			recoveryPath := filepath.Join(stateDir, filepath.Clean(tab.Recovery))
@@ -108,6 +114,10 @@ func LoadSession(stateDir string) ([]Snapshot, error) {
 				return nil, fmt.Errorf("invalid recovery path for %s", tab.Title)
 			}
 			snapshot.Text, err = os.ReadFile(recoveryPath)
+			if errors.Is(err, os.ErrNotExist) {
+				slog.Warn("skip session tab with missing recovery file", "title", tab.Title, "path", recoveryPath)
+				continue
+			}
 			if err != nil {
 				return nil, fmt.Errorf("read recovery for %s: %w", tab.Title, err)
 			}

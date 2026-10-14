@@ -18,6 +18,7 @@ import (
 	"github.com/jsnjack/e/internal/activity"
 	"github.com/jsnjack/e/internal/ai"
 	"github.com/jsnjack/e/internal/config"
+	"github.com/jsnjack/e/internal/document"
 	"github.com/jsnjack/e/internal/gtktest"
 	"github.com/jsnjack/e/internal/lsp"
 )
@@ -228,6 +229,7 @@ func TestEditorRuntimeSmoke(t *testing.T) {
 		t.Fatal("standalone E branding was not applied selectively")
 	}
 
+	checkEditingFixes(t, doc)
 	checkCompletionDoesNotRedrawText(t, doc)
 	checkCompletionLineEnds(t, doc)
 	checkCompletionLongLine(t, doc)
@@ -279,7 +281,11 @@ func TestEditorRuntimeSmoke(t *testing.T) {
 	if !w.keyPressed(gdk.KEY_backslash, 0, gdk.AltMask) {
 		t.Fatal("Alt+backslash did not trigger manual completion")
 	}
-	waitForUI(t, func() bool { return w.activity.serving.Text() == "runtime" })
+	// Wait for the suggestion itself: earlier automatic requests may already
+	// have set the status bar to this model.
+	waitForUI(t, func() bool {
+		return doc.ghostText == "completion" && w.activity.label.Text() == "Suggestion ready"
+	})
 	if doc.ghostText != "completion" || !doc.ghost.visible() {
 		t.Fatalf("generated completion was not visible: text=%q visible=%v", doc.ghostText, doc.ghost.visible())
 	}
@@ -425,8 +431,8 @@ func assertWindowActions(t *testing.T, w *window) {
 		"new": "<Control>n", "command-palette": "<Control><Shift>p", "quick-open": "<Control>p",
 		"open": "<Control>o", "save": "<Control>s", "save-as": "<Control><Shift>s",
 		"find": "<Control>f", "replace": "<Control>h", "markdown-preview": "<Control><Shift>v",
-		"undo": "<Control>z", "redo": "<Control><Shift>z", "toggle-sidebar": "<Control>b",
-		"show-sidebar": "<Control><Shift>e", "close-tab": "<Control>w", "complete": "<Alt>backslash",
+		"toggle-sidebar": "<Control>b",
+		"show-sidebar":   "<Control><Shift>e", "close-tab": "<Control>w", "complete": "<Alt>backslash",
 		"lsp-complete": "<Control>space", "select-next": "<Control>d",
 		"select-all-occurrences": "<Control><Shift>l", "next-tab": "<Control>Tab",
 		"previous-tab": "<Control><Shift>Tab", "find-next": "F3", "find-previous": "<Shift>F3",
@@ -436,8 +442,13 @@ func assertWindowActions(t *testing.T, w *window) {
 			t.Errorf("action %q accelerators = %v, want %q", action, got, shortcut)
 		}
 	}
+	// Undo and redo belong to the focused widget, so entries keep their own.
+	for _, action := range []string{"undo", "redo"} {
+		if got := w.app.AccelsForAction("win." + action); len(got) != 0 {
+			t.Errorf("action %q has global accelerators %v", action, got)
+		}
+	}
 	for _, alias := range []struct{ action, shortcut string }{
-		{action: "redo", shortcut: "<Control>y"},
 		{action: "select-all-occurrences", shortcut: "<Control>F2"},
 		{action: "select-all-occurrences", shortcut: "<Alt>Return"},
 	} {
@@ -501,15 +512,178 @@ func checkCompletionDoesNotRedrawText(t *testing.T, doc *editorDocument) {
 	}
 }
 
-func renderView(t *testing.T, widget *gtk.TextView) ([]byte, int) {
+func checkEditingFixes(t *testing.T, doc *editorDocument) {
 	t.Helper()
-	// Let pending text changes allocate before snapshotting.
+	// Ctrl+D right after a word selects that word, not the next one too.
+	setBufferText(doc, "foo bar foo")
+	doc.buffer.PlaceCursor(doc.buffer.IterAtOffset(3))
+	doc.selectNextOccurrence()
+	if len(doc.multiCursors) != 2 || doc.multiCursors[0] != (multiCursor{0, 3}) || doc.multiCursors[1] != (multiCursor{8, 11}) {
+		t.Fatalf("Ctrl+D at a word end = %v", doc.multiCursors)
+	}
+	doc.clearMultipleSelections()
+
+	// Carets moved onto the same offset merge instead of typing twice.
+	setBufferText(doc, "abc\nabc\nabc")
+	doc.buffer.PlaceCursor(doc.buffer.StartIter())
+	doc.addCursorVertically(1)
+	doc.addCursorVertically(1)
+	doc.moveMultiple(gdk.KEY_Home, false, true)
+	doc.replaceMultiple("x")
+	if got := bufferText(doc.buffer); got != "xabc\nabc\nabc" {
+		t.Fatalf("merged carets typed %q", got)
+	}
+	doc.clearMultipleSelections()
+
+	checkMultiCursorEditing(t, doc)
+
+	// Typing the predicted text keeps the rest of the suggestion visible.
+	setBufferText(doc, "typed")
+	doc.buffer.PlaceCursor(doc.buffer.EndIter())
+	doc.showCompletion(" suggestion here", doc.buffer.CharCount())
+	doc.buffer.InsertInteractiveAtCursor(" su", true)
+	if doc.ghostText != "ggestion here" || !doc.ghost.visible() {
+		t.Fatalf("type-through left ghost %q", doc.ghostText)
+	}
+	if !doc.keyPressed(gdk.KEY_Right, 0, gdk.ControlMask) || doc.ghostText != " here" {
+		t.Fatalf("Ctrl+Right partial accept left ghost %q", doc.ghostText)
+	}
+	if got := bufferText(doc.buffer); got != "typed suggestion" {
+		t.Fatalf("partial accept text = %q", got)
+	}
+	doc.dismissCompletion()
+
+	// Replace moves past its own replacement even when it contains the query.
+	setBufferText(doc, "a a")
+	doc.search.update("a")
+	waitForUI(t, func() bool { return len(doc.search.matches) == 2 })
+	// The first press selects a match; each later one replaces and moves on.
+	for range 3 {
+		doc.search.replaceCurrent("ab")
+		waitForUI(t, func() bool { return len(doc.search.matches) > 0 })
+	}
+	if got := bufferText(doc.buffer); got != "ab ab" {
+		t.Fatalf("repeated Replace = %q", got)
+	}
+	doc.search.update("")
+
+	// Save cleanup edits the buffer in place and keeps it in step with disk.
+	text := "a  \nb\t\nc"
+	setBufferText(doc, text)
+	doc.applySaveCleanup([]byte(text), document.PrepareSave([]byte(text), true, true))
+	if got := bufferText(doc.buffer); got != "a\nb\nc\n" {
+		t.Fatalf("save cleanup = %q", got)
+	}
+}
+
+func checkMultiCursorEditing(t *testing.T, doc *editorDocument) {
+	t.Helper()
+	key := func(keyval uint, state gdk.ModifierType) {
+		t.Helper()
+		if !doc.keyPressed(keyval, 0, state) {
+			t.Fatalf("key %d with state %d was not handled", keyval, state)
+		}
+	}
+	// Ctrl+Shift+Down keeps the column across a shorter line.
+	setBufferText(doc, "abcdef\nab\nabcdef")
+	doc.buffer.PlaceCursor(doc.buffer.IterAtOffset(4))
+	key(gdk.KEY_Down, gdk.ControlMask|gdk.ShiftMask)
+	key(gdk.KEY_Down, gdk.ControlMask|gdk.ShiftMask)
+	if len(doc.multiCursors) != 3 || doc.multiCursors[1].head != 9 || doc.multiCursors[2].head != 14 {
+		t.Fatalf("vertical cursors = %v", doc.multiCursors)
+	}
+	key(gdk.KEY_u, gdk.ControlMask)
+	if len(doc.multiCursors) != 2 {
+		t.Fatalf("Ctrl+U left %d cursors", len(doc.multiCursors))
+	}
+	key(gdk.KEY_Escape, 0)
+	if len(doc.multiCursors) != 0 {
+		t.Fatal("Escape did not leave multi-cursor mode")
+	}
+
+	// Enter keeps each line's indentation; Tab with selections indents lines.
+	setBufferText(doc, "  one\n\ttwo")
+	doc.buffer.PlaceCursor(doc.buffer.IterAtOffset(5))
+	key(gdk.KEY_Down, gdk.ControlMask|gdk.ShiftMask)
+	if len(doc.multiCursors) != 2 {
+		t.Fatalf("cursors = %v", doc.multiCursors)
+	}
+	doc.multiCursors[1] = multiCursor{anchor: 10, head: 10}
+	key(gdk.KEY_Return, 0)
+	if got := bufferText(doc.buffer); got != "  one\n  \n\ttwo\n\t" {
+		t.Fatalf("multi-cursor Enter = %q", got)
+	}
+	key(gdk.KEY_Escape, 0)
+	setBufferText(doc, "a\nb")
+	doc.multiCursors = []multiCursor{{0, 1}, {2, 3}}
+	doc.renderMultipleSelections()
+	key(gdk.KEY_Tab, 0)
+	spaces, width := doc.indentation()
+	unit := "\t"
+	if spaces {
+		unit = strings.Repeat(" ", width)
+	}
+	if got := bufferText(doc.buffer); got != unit+"a\n"+unit+"b" {
+		t.Fatalf("multi-cursor Tab = %q", got)
+	}
+	key(gdk.KEY_ISO_Left_Tab, gdk.ShiftMask)
+	if got := bufferText(doc.buffer); got != "a\nb" {
+		t.Fatalf("multi-cursor Shift+Tab = %q", got)
+	}
+	key(gdk.KEY_Escape, 0)
+
+	// Shift+Alt+drag makes one cursor per line. A drag happens on laid-out
+	// text, so let GTK lay it out first.
+	setBufferText(doc, "abc\nabc\nabc")
+	waitFrames(t, doc.view.Widget, 2)
+	first := doc.view.Widget.IterLocation(doc.buffer.IterAtOffset(1))
+	last := doc.view.Widget.IterLocation(doc.buffer.IterAtOffset(10))
+	doc.selectColumn(first.X(), first.Y(), last.X(), last.Y())
+	if len(doc.multiCursors) != 3 || doc.multiCursors[2] != (multiCursor{9, 10}) {
+		t.Fatalf("column selection = %v", doc.multiCursors)
+	}
+	doc.replaceMultiple("X")
+	if got := bufferText(doc.buffer); got != "aXc\naXc\naXc" {
+		t.Fatalf("column edit = %q", got)
+	}
+
+	// Secondary carets are drawn by the view, at the caret positions.
+	view := doc.view.Widget
+	view.SetCursorVisible(false)
+	defer view.SetCursorVisible(true)
+	withCarets, stride := renderView(t, view)
+	doc.clearMultipleSelections()
+	without, _ := renderView(t, view)
+	caret := view.IterLocation(doc.buffer.IterAtOffset(2))
+	caretX, caretY := view.BufferToWindowCoords(gtk.TextWindowWidget, caret.X(), caret.Y())
+	drawn := false
+	for index := range withCarets {
+		if withCarets[index] != without[index] {
+			x, y := (index%stride)/4, index/stride
+			if x >= caretX-1 && x <= caretX+1 && y >= caretY && y < caretY+caret.Height() {
+				drawn = true
+			}
+		}
+	}
+	if !drawn {
+		t.Fatal("secondary caret was not drawn at its position")
+	}
+}
+
+func waitFrames(t *testing.T, widget *gtk.TextView, count int) {
+	t.Helper()
 	frames := 0
 	widget.AddTickCallback(func(gtk.Widgetter, gdk.FrameClocker) bool {
 		frames++
-		return frames < 2
+		return frames < count
 	})
-	waitForUI(t, func() bool { return frames >= 2 })
+	waitForUI(t, func() bool { return frames >= count })
+}
+
+func renderView(t *testing.T, widget *gtk.TextView) ([]byte, int) {
+	t.Helper()
+	// Let pending text changes allocate before snapshotting.
+	waitFrames(t, widget, 2)
 	pixels, stride, err := gtktest.Render(widget)
 	if err != nil {
 		t.Fatal(err)

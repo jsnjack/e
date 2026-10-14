@@ -4,205 +4,475 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
-	"sort"
 	"strings"
 
 	"github.com/diamondburned/gotk4-adwaita/pkg/adw"
+	coreglib "github.com/diamondburned/gotk4/pkg/core/glib"
+	"github.com/diamondburned/gotk4/pkg/gdk/v4"
+	"github.com/diamondburned/gotk4/pkg/gio/v2"
+	"github.com/diamondburned/gotk4/pkg/glib/v2"
 	"github.com/diamondburned/gotk4/pkg/gtk/v4"
+	"github.com/diamondburned/gotk4/pkg/pango"
 	"github.com/jsnjack/e/internal/dispatch"
 	"github.com/jsnjack/e/internal/editorconfig"
 	"github.com/jsnjack/e/internal/logging"
 )
 
-// setProjectRoot enables the project sidebar for a directory passed on the
-// command line. Only the visible directory level is read; subdirectories are
-// scanned on first expansion.
+// projectTree is the project sidebar. A GtkTreeListModel asks for a folder's
+// children only when the folder expands, and the GtkListView builds widgets
+// only for visible rows. Each folder's children live in one GtkStringList of
+// absolute paths that is filled from a background directory read.
+type projectTree struct {
+	w        *window
+	root     string
+	closed   bool
+	models   map[string]*gtk.StringList
+	dirs     map[string]bool
+	loads    map[string]int
+	rows     map[uintptr]*projectRow
+	tree     *gtk.TreeListModel
+	list     *gtk.ListView
+	status   *gtk.Label
+	dirMenu  *gio.Menu
+	fileMenu *gio.Menu
+	popover  *gtk.PopoverMenu
+	target   string
+}
+
+// projectRow is the widget set of one recycled list row.
+type projectRow struct {
+	expander *gtk.TreeExpander
+	content  *gtk.Box
+	icon     *gtk.Image
+	label    *gtk.Label
+	row      *gtk.TreeListRow
+	notify   coreglib.SignalHandle
+	path     string
+	dir      bool
+}
+
+// setProjectRoot enables the project sidebar for a directory. Only the root
+// level is read; subdirectories are read on expansion. Opening the current
+// root again refreshes the tree in place.
 func (w *window) setProjectRoot(path string) {
 	root, err := filepath.Abs(path)
 	if err != nil {
 		w.toast("Couldn’t open project folder")
 		return
 	}
-	w.projectRoot = root
-	logging.Trace("ui: open project", "root", root)
-	clearBox(w.sidebarBody)
-	w.sidebarBody.AddCSSClass("project-tree")
-	headerRow := gtk.NewBox(gtk.OrientationHorizontal, 4)
-	header := gtk.NewLabel(filepath.Base(root))
-	header.SetXAlign(0)
-	header.SetHExpand(true)
-	header.AddCSSClass("heading")
-	headerRow.SetMarginStart(8)
-	headerRow.SetMarginEnd(4)
-	headerRow.SetMarginTop(4)
-	headerRow.SetMarginBottom(4)
-	headerRow.Append(header)
-	newFile := gtk.NewButtonFromIconName("document-new-symbolic")
-	newFile.SetTooltipText("New File")
-	newFile.AddCSSClass("flat")
-	newFile.ConnectClicked(func() { w.createProjectEntry(root, false) })
-	newFolder := gtk.NewButtonFromIconName("folder-new-symbolic")
-	newFolder.SetTooltipText("New Folder")
-	newFolder.AddCSSClass("flat")
-	newFolder.ConnectClicked(func() { w.createProjectEntry(root, true) })
-	refresh := gtk.NewButtonFromIconName("view-refresh-symbolic")
-	refresh.SetTooltipText("Refresh Explorer")
-	refresh.AddCSSClass("flat")
-	refresh.ConnectClicked(func() { w.setProjectRoot(root) })
-	headerRow.Append(newFile)
-	headerRow.Append(newFolder)
-	headerRow.Append(refresh)
-	w.sidebarBody.Append(headerRow)
-	items := gtk.NewBox(gtk.OrientationVertical, 0)
-	w.sidebarBody.Append(items)
-	w.loadDirectory(root, root, items)
+	if tree := w.projectTree; tree != nil && tree.root == root && w.projectRoot == root {
+		tree.refresh()
+	} else {
+		if tree != nil {
+			tree.closed = true
+		}
+		w.projectRoot = root
+		logging.Trace("ui: open project", "root", root)
+		w.projectTree = newProjectTree(w, root)
+	}
 	w.sidebarToggle.SetVisible(true)
 	w.sidebar.SetVisible(true)
 	w.content.SetPosition(max(w.sidebarWidth, 160))
 	w.title.SetSubtitle(root)
 }
 
-func (w *window) loadDirectory(root, directory string, target *gtk.Box) {
-	loading := gtk.NewLabel("Loading…")
-	loading.SetXAlign(0)
-	loading.AddCSSClass("dim-label")
-	loading.SetMarginStart(8)
-	target.Append(loading)
+func newProjectTree(w *window, root string) *projectTree {
+	t := &projectTree{
+		w:      w,
+		root:   root,
+		models: map[string]*gtk.StringList{},
+		dirs:   map[string]bool{root: true},
+		loads:  map[string]int{},
+		rows:   map[uintptr]*projectRow{},
+	}
+	clearBox(w.sidebarBody)
+	w.sidebarBody.AddCSSClass("project-tree")
+	w.sidebarBody.Append(t.header())
+
+	t.status = gtk.NewLabel("Loading…")
+	t.status.SetXAlign(0)
+	t.status.AddCSSClass("dim-label")
+	t.status.SetMarginStart(8)
+	w.sidebarBody.Append(t.status)
+
+	t.tree = gtk.NewTreeListModel(t.model(root), false, false, t.createModel)
+	factory := gtk.NewSignalListItemFactory()
+	factory.ConnectSetup(t.setupRow)
+	factory.ConnectBind(t.bindRow)
+	factory.ConnectUnbind(t.unbindRow)
+	factory.ConnectTeardown(t.teardownRow)
+	t.list = gtk.NewListView(gtk.NewNoSelection(t.tree), &factory.ListItemFactory)
+	t.list.AddCSSClass("navigation-sidebar")
+	t.list.SetSingleClickActivate(true)
+	t.list.ConnectActivate(t.activate)
+	t.list.InsertActionGroup("tree", t.actions())
+
+	t.dirMenu = gio.NewMenu()
+	t.dirMenu.Append("New File", "tree.new-file")
+	t.dirMenu.Append("New Folder", "tree.new-folder")
+	t.dirMenu.Append("Rename…", "tree.rename")
+	t.dirMenu.Append("Delete…", "tree.delete")
+	t.fileMenu = gio.NewMenu()
+	t.fileMenu.Append("Rename…", "tree.rename")
+	t.fileMenu.Append("Delete…", "tree.delete")
+	t.popover = gtk.NewPopoverMenuFromModel(t.dirMenu)
+	t.popover.SetHasArrow(false)
+	t.popover.SetHAlign(gtk.AlignStart)
+
+	scroller := gtk.NewScrolledWindow()
+	scroller.SetPolicy(gtk.PolicyNever, gtk.PolicyAutomatic)
+	scroller.SetVExpand(true)
+	scroller.SetChild(t.list)
+	w.sidebarBody.Append(scroller)
+
+	t.load(root)
+	return t
+}
+
+func (t *projectTree) header() *gtk.Box {
+	row := gtk.NewBox(gtk.OrientationHorizontal, 4)
+	header := gtk.NewLabel(filepath.Base(t.root))
+	header.SetXAlign(0)
+	header.SetHExpand(true)
+	header.AddCSSClass("heading")
+	row.SetMarginStart(8)
+	row.SetMarginEnd(4)
+	row.SetMarginTop(4)
+	row.SetMarginBottom(4)
+	row.Append(header)
+	add := func(icon, tooltip string, run func()) {
+		button := gtk.NewButtonFromIconName(icon)
+		button.SetTooltipText(tooltip)
+		button.AddCSSClass("flat")
+		button.ConnectClicked(run)
+		row.Append(button)
+	}
+	add("document-new-symbolic", "New File", func() { t.w.createProjectEntry(t.root, false) })
+	add("folder-new-symbolic", "New Folder", func() { t.w.createProjectEntry(t.root, true) })
+	add("view-refresh-symbolic", "Refresh Explorer", t.refresh)
+	return row
+}
+
+func (t *projectTree) actions() *gio.SimpleActionGroup {
+	group := gio.NewSimpleActionGroup()
+	add := func(name string, run func(path string)) {
+		action := gio.NewSimpleAction(name, nil)
+		action.ConnectActivate(func(*glib.Variant) {
+			if t.target != "" {
+				run(t.target)
+			}
+		})
+		group.AddAction(action)
+	}
+	add("new-file", func(path string) { t.w.createProjectEntry(path, false) })
+	add("new-folder", func(path string) { t.w.createProjectEntry(path, true) })
+	add("rename", t.w.renameProjectEntry)
+	add("delete", t.w.deleteProjectEntry)
+	return group
+}
+
+// model returns the cached child list of directory, creating an empty one.
+// It does not read the directory.
+func (t *projectTree) model(directory string) *gtk.StringList {
+	list := t.models[directory]
+	if list == nil {
+		list = gtk.NewStringList(nil)
+		t.models[directory] = list
+	}
+	return list
+}
+
+// createModel gives GtkTreeListModel the child list of a folder row. GTK
+// also calls it to probe whether a row can expand, so it never starts a
+// read; the row's expanded notification does.
+func (t *projectTree) createModel(item *coreglib.Object) *gio.ListModel {
+	object, ok := item.Cast().(*gtk.StringObject)
+	if !ok || !t.dirs[object.String()] {
+		return nil
+	}
+	return &t.model(object.String()).ListModel
+}
+
+// load reads directory in the background and merges the result into its
+// cached list. Only the newest read of a directory is applied.
+func (t *projectTree) load(directory string) {
+	t.loads[directory]++
+	sequence := t.loads[directory]
 	go func() {
-		entries, err := os.ReadDir(directory)
+		entries, err := readProjectDir(directory)
 		dispatch.Main(func() {
-			if w.projectRoot != root {
+			if t.closed || t.loads[directory] != sequence {
 				return
 			}
-			clearBox(target)
+			if directory == t.root {
+				t.status.SetVisible(err != nil)
+				if err != nil {
+					t.status.SetText("Folder unavailable")
+					t.status.RemoveCSSClass("dim-label")
+					t.status.AddCSSClass("error")
+				}
+			}
 			if err != nil {
-				label := gtk.NewLabel("Folder unavailable")
-				label.SetXAlign(0)
-				label.AddCSSClass("error")
-				target.Append(label)
 				slog.Debug("read project directory", "path", directory, "err", err)
 				return
 			}
 			logging.Trace("ui: project directory ready", "path", directory, "entries", len(entries))
-			sort.SliceStable(entries, func(i, j int) bool {
-				if entries[i].IsDir() != entries[j].IsDir() {
-					return entries[i].IsDir()
-				}
-				return strings.ToLower(entries[i].Name()) < strings.ToLower(entries[j].Name())
-			})
-			for _, entry := range entries {
-				if entry.Name() == ".git" || entry.Name() == ".hg" || entry.Name() == ".svn" {
-					continue
-				}
-				path := filepath.Join(directory, entry.Name())
-				if entry.IsDir() {
-					w.appendDirectory(root, path, entry.Name(), target)
-				} else {
-					w.appendFile(path, entry.Name(), target)
-				}
-			}
+			t.apply(directory, entries)
 		})
 	}()
 }
 
-func (w *window) appendDirectory(root, path, name string, target *gtk.Box) {
-	container := gtk.NewOverlay()
-	container.AddCSSClass("project-entry-row")
-	expander := gtk.NewExpander("")
-	expander.SetHExpand(true)
-	labelRow := gtk.NewBox(gtk.OrientationHorizontal, 6)
-	labelRow.AddCSSClass("project-folder")
-	labelRow.SetMarginEnd(32)
-	icon := gtk.NewImageFromIconName("folder-symbolic")
-	label := gtk.NewLabel(name)
-	label.AddCSSClass("project-entry-label")
-	label.SetXAlign(0)
-	label.SetHExpand(true)
-	labelRow.Append(icon)
-	labelRow.Append(label)
-	expander.SetLabelWidget(labelRow)
-	children := gtk.NewBox(gtk.OrientationVertical, 0)
-	children.SetMarginStart(14)
-	expander.SetChild(children)
-	loaded := false
-	expander.ConnectActivate(func() {
-		if loaded {
-			return
+// apply merges entries into the cached list of directory. Unchanged entries
+// keep their rows, so expanded folders below them stay expanded.
+func (t *projectTree) apply(directory string, entries []projectEntry) {
+	list := t.models[directory]
+	if list == nil {
+		return
+	}
+	count := list.NItems()
+	old := make([]projectEntry, 0, count)
+	for i := uint(0); i < count; i++ {
+		path := list.String(i)
+		old = append(old, projectEntry{path: path, dir: t.dirs[path]})
+	}
+	splices := diffProjectEntries(old, entries)
+	if len(splices) == 0 {
+		return
+	}
+	for _, entry := range entries {
+		t.dirs[entry.path] = entry.dir
+	}
+	for _, splice := range splices {
+		additions := make([]string, len(splice.additions))
+		for i, entry := range splice.additions {
+			additions[i] = entry.path
 		}
-		loaded = true
-		w.loadDirectory(root, path, children)
-	})
-	menu := w.projectEntryMenu(path, true)
-	menu.SetHAlign(gtk.AlignEnd)
-	menu.SetVAlign(gtk.AlignStart)
-	menu.SetMarginTop(2)
-	menu.SetMarginEnd(2)
-	container.SetChild(expander)
-	container.AddOverlay(menu)
-	target.Append(container)
+		list.Splice(uint(splice.position), uint(splice.removals), additions)
+	}
+	kept := make(map[string]bool, len(entries))
+	for _, entry := range entries {
+		kept[entry.path] = true
+	}
+	for _, entry := range old {
+		if !kept[entry.path] {
+			t.forget(entry.path)
+		}
+	}
 }
 
-func (w *window) appendFile(path, name string, target *gtk.Box) {
-	container := gtk.NewBox(gtk.OrientationHorizontal, 2)
-	container.AddCSSClass("project-entry-row")
-	button := gtk.NewButton()
-	button.AddCSSClass("flat")
-	button.AddCSSClass("project-entry-open")
-	button.SetHAlign(gtk.AlignFill)
-	button.SetHExpand(true)
-	content := gtk.NewBox(gtk.OrientationHorizontal, 7)
-	icon := gtk.NewImageFromIconName("text-x-generic-symbolic")
-	label := gtk.NewLabel(name)
-	label.AddCSSClass("project-entry-label")
-	label.SetXAlign(0)
-	label.SetHExpand(true)
-	content.Append(icon)
-	content.Append(label)
-	button.SetChild(content)
-	button.SetTooltipText(path)
-	button.ConnectClicked(func() { w.openPath(path) })
-	container.Append(button)
-	container.Append(w.projectEntryMenu(path, false))
-	target.Append(container)
+// forget drops cached state for path and everything below it.
+func (t *projectTree) forget(path string) {
+	prefix := path + string(filepath.Separator)
+	for key := range t.dirs {
+		if key == path || strings.HasPrefix(key, prefix) {
+			delete(t.dirs, key)
+		}
+	}
+	for key := range t.models {
+		if key == path || strings.HasPrefix(key, prefix) {
+			delete(t.models, key)
+			delete(t.loads, key)
+		}
+	}
+}
+
+// reload rereads directory if the tree has listed it.
+func (t *projectTree) reload(directory string) {
+	if t.models[directory] != nil {
+		t.load(directory)
+	}
+}
+
+// refresh rereads the root and every expanded folder in place. Cached lists
+// of collapsed folders are dropped; they are read again on expansion.
+func (t *projectTree) refresh() {
+	expanded := map[string]bool{t.root: true}
+	for i := uint(0); i < t.tree.NItems(); i++ {
+		row := t.tree.Row(i)
+		if row == nil || !row.Expanded() {
+			continue
+		}
+		if path, ok := projectRowPath(row); ok {
+			expanded[path] = true
+		}
+	}
+	for path := range t.models {
+		if !expanded[path] {
+			delete(t.models, path)
+			delete(t.loads, path)
+		}
+	}
+	for path := range expanded {
+		t.model(path)
+		t.load(path)
+	}
+}
+
+func projectRowPath(row *gtk.TreeListRow) (string, bool) {
+	item := row.Item()
+	if item == nil {
+		return "", false
+	}
+	object, ok := item.Cast().(*gtk.StringObject)
+	if !ok {
+		return "", false
+	}
+	return object.String(), true
+}
+
+func (t *projectTree) activate(position uint) {
+	row := t.tree.Row(position)
+	if row == nil {
+		return
+	}
+	path, ok := projectRowPath(row)
+	if !ok {
+		return
+	}
+	if t.dirs[path] {
+		row.SetExpanded(!row.Expanded())
+		return
+	}
+	t.w.openPath(path)
+}
+
+func (t *projectTree) setupRow(object *coreglib.Object) {
+	item, ok := object.Cast().(*gtk.ListItem)
+	if !ok {
+		return
+	}
+	r := &projectRow{expander: gtk.NewTreeExpander()}
+	r.expander.SetIndentForIcon(true)
+	r.expander.AddCSSClass("project-entry-row")
+	r.content = gtk.NewBox(gtk.OrientationHorizontal, 7)
+	r.icon = gtk.NewImage()
+	r.label = gtk.NewLabel("")
+	r.label.AddCSSClass("project-entry-label")
+	r.label.SetXAlign(0)
+	r.label.SetHExpand(true)
+	r.label.SetEllipsize(pango.EllipsizeMiddle)
+	more := gtk.NewButtonFromIconName("view-more-symbolic")
+	more.AddCSSClass("flat")
+	more.AddCSSClass("project-entry-menu")
+	more.SetVAlign(gtk.AlignCenter)
+	more.ConnectClicked(func() {
+		if bounds, ok := more.ComputeBounds(r.expander); ok {
+			t.showMenu(r, gdk.NewRectangle(int(bounds.X()), int(bounds.Y()), int(bounds.Width()), int(bounds.Height())))
+		}
+	})
+	r.content.Append(r.icon)
+	r.content.Append(r.label)
+	r.content.Append(more)
+	r.expander.SetChild(r.content)
+	click := gtk.NewGestureClick()
+	click.SetButton(gdk.BUTTON_SECONDARY)
+	click.ConnectPressed(func(_ int, x, y float64) {
+		t.showMenu(r, gdk.NewRectangle(int(x), int(y), 1, 1))
+	})
+	r.expander.AddController(click)
+	item.SetChild(r.expander)
+	t.rows[item.Native()] = r
+}
+
+func (t *projectTree) bindRow(object *coreglib.Object) {
+	item, ok := object.Cast().(*gtk.ListItem)
+	if !ok {
+		return
+	}
+	r := t.rows[item.Native()]
+	if r == nil || item.Item() == nil {
+		return
+	}
+	row, ok := item.Item().Cast().(*gtk.TreeListRow)
+	if !ok {
+		return
+	}
+	path, ok := projectRowPath(row)
+	if !ok {
+		return
+	}
+	r.row, r.path, r.dir = row, path, t.dirs[path]
+	r.expander.SetListRow(row)
+	r.label.SetText(filepath.Base(path))
+	r.expander.SetTooltipText(path)
+	if r.dir {
+		r.icon.SetFromIconName("folder-symbolic")
+		r.content.RemoveCSSClass("project-entry-open")
+		r.content.AddCSSClass("project-folder")
+	} else {
+		r.icon.SetFromIconName("text-x-generic-symbolic")
+		r.content.RemoveCSSClass("project-folder")
+		r.content.AddCSSClass("project-entry-open")
+	}
+	r.notify = row.NotifyProperty("expanded", func() {
+		if row.Expanded() {
+			t.load(path)
+		}
+	})
+}
+
+func (t *projectTree) unbindRow(object *coreglib.Object) {
+	item, ok := object.Cast().(*gtk.ListItem)
+	if !ok {
+		return
+	}
+	r := t.rows[item.Native()]
+	if r == nil || r.row == nil {
+		return
+	}
+	r.row.HandlerDisconnect(r.notify)
+	r.expander.SetListRow(nil)
+	r.row, r.path = nil, ""
+}
+
+func (t *projectTree) teardownRow(object *coreglib.Object) {
+	item, ok := object.Cast().(*gtk.ListItem)
+	if !ok {
+		return
+	}
+	r := t.rows[item.Native()]
+	delete(t.rows, item.Native())
+	if r != nil && t.popover.Parent() != nil &&
+		gtk.BaseWidget(t.popover.Parent()).Native() == r.expander.Native() {
+		t.popover.Popdown()
+		t.popover.Unparent()
+	}
+}
+
+// showMenu opens the shared context menu for the row's entry. The one
+// popover moves to the clicked row instead of each row owning a menu.
+func (t *projectTree) showMenu(r *projectRow, at gdk.Rectangle) {
+	if r.path == "" {
+		return
+	}
+	t.target = r.path
+	if r.dir {
+		t.popover.SetMenuModel(t.dirMenu)
+	} else {
+		t.popover.SetMenuModel(t.fileMenu)
+	}
+	if parent := t.popover.Parent(); parent == nil || gtk.BaseWidget(parent).Native() != r.expander.Native() {
+		if parent != nil {
+			t.popover.Unparent()
+		}
+		t.popover.SetParent(r.expander)
+	}
+	t.popover.SetPointingTo(&at)
+	t.popover.Popup()
+}
+
+// reloadProjectDir rereads directory after a file operation; other folders
+// keep their rows and expansion.
+func (w *window) reloadProjectDir(directory string) {
+	if tree := w.projectTree; tree != nil && !tree.closed {
+		tree.reload(directory)
+	}
 }
 
 func clearBox(box *gtk.Box) {
 	for child := box.FirstChild(); child != nil; child = box.FirstChild() {
 		box.Remove(child)
 	}
-}
-
-func (w *window) projectEntryMenu(path string, directory bool) *gtk.MenuButton {
-	menu := gtk.NewMenuButton()
-	menu.SetIconName("view-more-symbolic")
-	menu.SetTooltipText("More actions for " + filepath.Base(path))
-	menu.AddCSSClass("flat")
-	menu.AddCSSClass("project-entry-menu")
-	popover := gtk.NewPopover()
-	actions := gtk.NewBox(gtk.OrientationVertical, 2)
-	actions.SetMarginTop(6)
-	actions.SetMarginBottom(6)
-	actions.SetMarginStart(6)
-	actions.SetMarginEnd(6)
-	add := func(label string, run func()) {
-		button := gtk.NewButtonWithLabel(label)
-		button.AddCSSClass("flat")
-		button.SetHAlign(gtk.AlignFill)
-		button.ConnectClicked(func() {
-			popover.Popdown()
-			run()
-		})
-		actions.Append(button)
-	}
-	if directory {
-		add("New File", func() { w.createProjectEntry(path, false) })
-		add("New Folder", func() { w.createProjectEntry(path, true) })
-	}
-	add("Rename…", func() { w.renameProjectEntry(path) })
-	add("Delete…", func() { w.deleteProjectEntry(path) })
-	popover.SetChild(actions)
-	menu.SetPopover(popover)
-	return menu
 }
 
 func (w *window) createProjectEntry(parent string, directory bool) {
@@ -232,7 +502,7 @@ func (w *window) createProjectEntry(parent string, directory bool) {
 					w.toast("Couldn’t create " + name)
 					return
 				}
-				w.setProjectRoot(w.projectRoot)
+				w.reloadProjectDir(parent)
 				if !directory {
 					w.openPath(path)
 				}
@@ -263,7 +533,7 @@ func (w *window) renameProjectEntry(path string) {
 						doc.changePath(filepath.Join(replacement, strings.TrimPrefix(doc.path, prefix)))
 					}
 				}
-				w.setProjectRoot(w.projectRoot)
+				w.reloadProjectDir(filepath.Dir(path))
 			})
 		}()
 	})
@@ -312,7 +582,7 @@ func (w *window) deleteProjectEntry(path string) {
 						doc.updatePresentation()
 					}
 				}
-				w.setProjectRoot(w.projectRoot)
+				w.reloadProjectDir(filepath.Dir(path))
 			})
 		}()
 	})

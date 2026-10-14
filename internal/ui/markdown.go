@@ -72,11 +72,11 @@ func (d *editorDocument) renderMarkdownPreview() {
 	}, func(source string) {
 		d.previewBusy = true
 		go func() {
-			document, err := markdownpreview.Render([]byte(source), title)
+			page, err := markdownpreview.RenderPage([]byte(source), title)
 			dispatch.Main(func() {
 				d.previewBusy = false
 				if err == nil && !d.closed && d.previewVisible && generation == d.previewGen {
-					d.preview.Load(document, baseURI)
+					d.preview.Show(page, baseURI)
 				}
 				if d.previewPending && !d.closed && d.previewVisible {
 					d.previewPending = false

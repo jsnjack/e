@@ -51,12 +51,6 @@ func NewCompleter(providers []Provider) *Completer {
 // Start begins availability probes until ctx is cancelled.
 func (c *Completer) Start(ctx context.Context) { c.chain.Start(ctx) }
 
-// Complete returns a cached or freshly generated insertion.
-func (c *Completer) Complete(ctx context.Context, req Request) (string, error) {
-	result, err := c.CompleteDetailed(ctx, req)
-	return result.Text, err
-}
-
 // CompleteDetailed returns a completion and the exact model that served it.
 func (c *Completer) CompleteDetailed(ctx context.Context, req Request) (Result, error) {
 	c.mu.Lock()
@@ -99,6 +93,7 @@ func Clean(result string, req Request) string {
 	for _, token := range []string{"<|fim_middle|>", "<|fim_prefix|>", "<|fim_suffix|>", "<|endoftext|>"} {
 		result = strings.ReplaceAll(result, token, "")
 	}
+	result = trimLineEcho(result, req.Prefix)
 	limit := 4096
 	if req.Instruction != "" {
 		limit = 64 * 1024
@@ -109,14 +104,66 @@ func Clean(result string, req Request) string {
 			result = result[:len(result)-1]
 		}
 	}
-	if req.Suffix != "" {
-		max := min(len(result), len(req.Suffix))
-		for n := max; n > 0; n-- {
-			if strings.HasSuffix(result, req.Suffix[:n]) {
-				result = strings.TrimSuffix(result, req.Suffix[:n])
-				break
-			}
+	result = trimSuffixOverlap(result, req.Suffix)
+	return trimTrailingBlankLines(result)
+}
+
+// trimLineEcho removes the part of the cursor line that chat models repeat at
+// the start of their answer. The longest tail of the line (3 bytes or more)
+// that starts result is removed; a 2-byte match is too often the model's own
+// continuation. Otherwise a duplicated run of trailing spaces
+// and tabs is removed.
+func trimLineEcho(result, prefix string) string {
+	line := prefix[strings.LastIndexByte(prefix, '\n')+1:]
+	for n := min(len(line), len(result)); n >= 3; n-- {
+		if strings.HasPrefix(result, line[len(line)-n:]) {
+			return result[n:]
 		}
 	}
-	return strings.TrimSuffix(result, "\n\n\n")
+	indent := line[len(strings.TrimRight(line, " \t")):]
+	if indent != "" && strings.HasPrefix(result, indent) {
+		return result[len(indent):]
+	}
+	return result
+}
+
+// trimSuffixOverlap removes text at the end of result that repeats the start
+// of the suffix. Only the longest overlap that holds a full line and at least
+// 8 non-whitespace bytes is removed. Shorter overlaps such as "\n}" are often
+// the model's own closing text and stay.
+func trimSuffixOverlap(result, suffix string) string {
+	for n := min(len(result), len(suffix)); n > 0; n-- {
+		overlap := suffix[:n]
+		if !strings.HasSuffix(result, overlap) || !strings.Contains(overlap, "\n") {
+			continue
+		}
+		atLineBoundary := n == len(suffix) || suffix[n] == '\n' || suffix[n-1] == '\n'
+		if atLineBoundary && nonSpaceBytes(overlap) >= 8 {
+			return result[:len(result)-n]
+		}
+	}
+	return result
+}
+
+func nonSpaceBytes(text string) int {
+	count := 0
+	for i := 0; i < len(text); i++ {
+		switch text[i] {
+		case ' ', '\t', '\n', '\r', '\v', '\f':
+		default:
+			count++
+		}
+	}
+	return count
+}
+
+// trimTrailingBlankLines drops whitespace-only lines at the end of result and
+// keeps one newline after the last line with content.
+func trimTrailingBlankLines(result string) string {
+	content := len(strings.TrimRight(result, " \t\n"))
+	end := strings.IndexByte(result[content:], '\n')
+	if end < 0 {
+		return result
+	}
+	return result[:content+end+1]
 }

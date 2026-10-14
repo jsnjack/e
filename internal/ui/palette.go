@@ -21,6 +21,18 @@ type paletteItem struct {
 	detail   string
 	shortcut string
 	run      func()
+	// key is the lowercased "title detail" text, built once per item so
+	// filtering does not allocate per keystroke.
+	key []rune
+}
+
+func withSearchKeys(items []paletteItem) []paletteItem {
+	for i := range items {
+		if items[i].key == nil {
+			items[i].key = []rune(strings.ToLower(items[i].title + " " + items[i].detail))
+		}
+	}
+	return items
 }
 
 func (w *window) showCommandPalette() {
@@ -87,11 +99,15 @@ func (w *window) commandPaletteItems() []paletteItem {
 }
 
 func (w *window) showQuickOpen() {
-	if w.projectRoot == "" {
-		w.toast("Open a folder to use Quick Open")
-		return
-	}
 	root := w.projectRoot
+	if root == "" {
+		doc := w.active()
+		if doc == nil || doc.path == "" {
+			w.toast("Open a folder to use Quick Open")
+			return
+		}
+		root = projectRootFor(doc.path, pathExists)
+	}
 	operation := w.activityHub.Begin(activity.Workspace, "Indexing project files")
 	w.showPalette("Quick Open", "Search files by name", func(deliver func([]paletteItem)) {
 		go func() {
@@ -108,6 +124,7 @@ func (w *window) showQuickOpen() {
 					run: func() { w.openPath(filepath.Join(root, relative)) },
 				})
 			}
+			withSearchKeys(items)
 			dispatch.Main(func() {
 				deliver(items)
 				operation.Finish(activity.Plural(len(items), "file", "files"), "", false)
@@ -197,7 +214,7 @@ func (w *window) showPalette(title, placeholder string, load func(func([]palette
 		if closed {
 			return
 		}
-		items = loaded
+		items = withSearchKeys(loaded)
 		refresh()
 	})
 	dialog.Present(w.win)
@@ -225,11 +242,18 @@ func filterPaletteItems(items []paletteItem, query string, limit int) []paletteI
 		item  paletteItem
 		score int
 	}
-	matches := make([]match, 0, len(items))
 	query = strings.TrimSpace(query)
+	if query == "" {
+		return items[:min(len(items), max(limit, 0))]
+	}
+	queryRunes := []rune(strings.ToLower(query))
+	matches := make([]match, 0, min(len(items), 1024))
 	for _, item := range items {
-		score := fuzzyScore(query, item.title+" "+item.detail)
-		if score >= 0 {
+		key := item.key
+		if key == nil {
+			key = []rune(strings.ToLower(item.title + " " + item.detail))
+		}
+		if score := fuzzyScoreRunes(queryRunes, key); score >= 0 {
 			matches = append(matches, match{item: item, score: score})
 		}
 	}
@@ -275,8 +299,10 @@ func paletteRow(item paletteItem) *gtk.ListBoxRow {
 
 // fuzzyScore rewards ordered, consecutive, and word-boundary matches.
 func fuzzyScore(query, candidate string) int {
-	queryRunes := []rune(strings.ToLower(query))
-	candidateRunes := []rune(strings.ToLower(candidate))
+	return fuzzyScoreRunes([]rune(strings.ToLower(query)), []rune(strings.ToLower(candidate)))
+}
+
+func fuzzyScoreRunes(queryRunes, candidateRunes []rune) int {
 	if len(queryRunes) == 0 {
 		return 0
 	}
