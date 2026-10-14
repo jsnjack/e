@@ -390,6 +390,7 @@ func (w *window) selectedPageChanged() {
 
 func (w *window) toggleSidebar() {
 	if w.projectRoot == "" {
+		w.showSidebar()
 		return
 	}
 	if w.sidebar.Visible() {
@@ -404,10 +405,38 @@ func (w *window) toggleSidebar() {
 
 func (w *window) showSidebar() {
 	if w.projectRoot == "" {
+		// Without an open folder, use the active file's project.
+		doc := w.active()
+		if doc == nil || doc.path == "" {
+			w.toast("Open a folder to show project files")
+			return
+		}
+		w.setProjectRoot(projectRootFor(doc.path, pathExists))
 		return
 	}
 	w.sidebar.SetVisible(true)
 	w.content.SetPosition(max(w.sidebarWidth, 160))
+}
+
+// projectRootFor returns the nearest ancestor of file that holds a .git entry,
+// or the file's directory when there is none.
+func projectRootFor(file string, exists func(string) bool) string {
+	dir := filepath.Dir(file)
+	for current := dir; ; {
+		if exists(filepath.Join(current, ".git")) {
+			return current
+		}
+		parent := filepath.Dir(current)
+		if parent == current {
+			return dir
+		}
+		current = parent
+	}
+}
+
+func pathExists(path string) bool {
+	_, err := os.Stat(path)
+	return err == nil
 }
 
 func (w *window) selectRelativeTab(direction int) {

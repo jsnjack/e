@@ -52,3 +52,19 @@ func TestRenameProjectPathDoesNotOverwrite(t *testing.T) {
 		t.Fatal(err)
 	}
 }
+
+func TestProjectRootFor(t *testing.T) {
+	repos := map[string]bool{"/home/user/repo/.git": true}
+	exists := func(path string) bool { return repos[path] }
+	tests := []struct{ file, want string }{
+		{"/home/user/repo/cmd/main.go", "/home/user/repo"},
+		{"/home/user/repo/main.go", "/home/user/repo"},
+		{"/home/user/notes/todo.md", "/home/user/notes"},
+		{"/todo.md", "/"},
+	}
+	for _, test := range tests {
+		if got := projectRootFor(test.file, exists); got != test.want {
+			t.Fatalf("projectRootFor(%q) = %q, want %q", test.file, got, test.want)
+		}
+	}
+}
