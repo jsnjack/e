@@ -24,9 +24,11 @@ editing, EditorConfig support, and availability-aware AI autocomplete.
   compare the buffer with the Git index copy of a tracked file, else with
   the saved file. The base is kept as line hashes, not as text. Ctrl+Alt+D
   opens the file's repository in gdiff.
-- Open Path (Ctrl+Alt+O) browses the whole filesystem one folder at a time.
-  Text without a leading `/` or `~/` fuzzy-matches recent paths from
-  `internal/recent` and the home folder.
+- Go to File or Folder (Ctrl+P) is the one picker. Text naming a folder (`/`,
+  `~/`, or a relative path with a `/`) lists it; relative paths resolve
+  against the project, or home without one. Other text fuzzy-matches project
+  files, then recent paths (`internal/recent`) and home, then walks folders
+  from home: `dow bana` finds `~/Downloads/banana.txt`.
 - The project sidebar is a `GtkListView` over a `GtkTreeListModel`. Folders
   are read off the GTK thread when expanded, and file operations reload only
   the affected folder, so expanded folders stay open. Dot files are hidden
@@ -52,7 +54,7 @@ editing, EditorConfig support, and availability-aware AI autocomplete.
 - `internal/markdownpreview` renders Markdown in a lazily loaded WebKitGTK view
   and replaces the page body in place after the first load.
 - `internal/workspace` lists project files for Quick Open, through
-  `git ls-files` inside a Git repository, and single folders for Open Path.
+  `git ls-files` inside a Git repository, and single folders for the picker.
 - `internal/recent` stores opened files and folders, ranked by how often and
   how lately each was opened.
 - `internal/linediff` compares line hashes with a bounded Myers diff.

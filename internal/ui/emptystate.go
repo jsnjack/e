@@ -15,10 +15,9 @@ import (
 // `e <folder>` and after the last tab closes. Its buttons run window actions,
 // so they follow the same code paths as the shortcuts they show.
 type emptyState struct {
-	root      *gtk.Box
-	title     *gtk.Label
-	subtitle  *gtk.Label
-	quickOpen *gtk.Button
+	root     *gtk.Box
+	title    *gtk.Label
+	subtitle *gtk.Label
 }
 
 func newEmptyState() *emptyState {
@@ -56,8 +55,7 @@ func newEmptyState() *emptyState {
 	actions := gtk.NewBox(gtk.OrientationVertical, 2)
 	actions.AddCSSClass("empty-actions")
 	actions.SetMarginTop(28)
-	e.quickOpen = emptyAction(actions, "system-search-symbolic", "Go to File", "win.quick-open", "Ctrl+P")
-	emptyAction(actions, "folder-saved-search-symbolic", "Open Path…", "win.open-path", "Ctrl+Alt+O")
+	emptyAction(actions, "system-search-symbolic", "Go to File or Folder", "win.quick-open", "Ctrl+P")
 	emptyAction(actions, "document-new-symbolic", "New File", "win.new", "Ctrl+N")
 	emptyAction(actions, "folder-open-symbolic", "Open Folder…", "win.open-folder", "Ctrl+K Ctrl+O")
 	emptyAction(actions, "utilities-terminal-symbolic", "Command Palette", "win.command-palette", "Ctrl+Shift+P")
@@ -129,12 +127,10 @@ func (e *emptyState) update(projectRoot string) {
 	if projectRoot == "" {
 		e.title.SetText("E")
 		e.subtitle.SetText("Open a folder or a file to start")
-		e.quickOpen.SetVisible(false)
 		return
 	}
 	e.title.SetText(filepath.Base(projectRoot))
 	e.subtitle.SetText(homeRelative(projectRoot))
-	e.quickOpen.SetVisible(true)
 }
 
 // homeRelative shows paths under the home directory with a leading "~".

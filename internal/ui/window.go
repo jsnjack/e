@@ -181,8 +181,7 @@ func (w *window) build() {
 
 	menu := gio.NewMenu()
 	menu.Append("Command Palette…", "win.command-palette")
-	menu.Append("Quick Open…", "win.quick-open")
-	menu.Append("Open Path…", "win.open-path")
+	menu.Append("Go to File or Folder…", "win.quick-open")
 	menu.Append("Open Folder…", "win.open-folder")
 	menu.Append("Save As…", "win.save-as")
 	menu.Append("Find and Replace", "win.replace")
@@ -324,7 +323,6 @@ func (w *window) registerActions() {
 	w.action("new", func() { w.newDocument(nil) }, "<Control>n")
 	w.action("open", w.chooseOpen, "<Control>o")
 	w.action("open-folder", w.chooseFolder)
-	w.action("open-path", w.showPathPicker, "<Control><Alt>o")
 	w.action("show-changes", w.showChangesInGdiff, "<Control><Alt>d")
 	w.action("command-palette", w.showCommandPalette, "<Control><Shift>p")
 	w.action("quick-open", w.showQuickOpen, "<Control>p")

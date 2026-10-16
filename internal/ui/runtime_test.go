@@ -418,7 +418,7 @@ func TestEditorRuntimeSmoke(t *testing.T) {
 func assertWindowActions(t *testing.T, w *window) {
 	t.Helper()
 	for _, name := range []string{
-		"new", "open", "open-folder", "open-path", "show-changes", "command-palette", "quick-open", "save", "save-as", "find", "replace",
+		"new", "open", "open-folder", "show-changes", "command-palette", "quick-open", "save", "save-as", "find", "replace",
 		"markdown-preview", "ai-transform", "undo", "redo", "toggle-sidebar", "show-sidebar", "close-tab",
 		"complete", "lsp-complete", "select-next", "select-all-occurrences", "next-tab", "previous-tab",
 		"find-next", "find-previous", "preferences", "shortcuts", "about",
@@ -429,7 +429,7 @@ func assertWindowActions(t *testing.T, w *window) {
 	}
 	for action, shortcut := range map[string]string{
 		"new": "<Control>n", "command-palette": "<Control><Shift>p", "quick-open": "<Control>p",
-		"open": "<Control>o", "open-path": "<Control><Alt>o", "show-changes": "<Control><Alt>d", "save": "<Control>s", "save-as": "<Control><Shift>s",
+		"open": "<Control>o", "show-changes": "<Control><Alt>d", "save": "<Control>s", "save-as": "<Control><Shift>s",
 		"find": "<Control>f", "replace": "<Control>h", "markdown-preview": "<Control><Shift>v",
 		"toggle-sidebar": "<Control>b",
 		"show-sidebar":   "<Control><Shift>e", "close-tab": "<Control>w", "complete": "<Alt>backslash",

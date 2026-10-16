@@ -6,6 +6,8 @@ import (
 	"fmt"
 	"log/slog"
 	"os"
+	"path/filepath"
+	"strings"
 
 	"github.com/jsnjack/e/internal/ai"
 	"github.com/jsnjack/e/internal/config"
@@ -101,8 +103,29 @@ var rootCmd = &cobra.Command{
 		return ui.Run(ui.Options{
 			Version: Version, ConfigPath: configPath, Config: cfg, Paths: paths, Completer: completer,
 			RebuildCompleter: rebuild, TestModel: testModel,
-		}, args)
+		}, expandHome(args))
 	},
+}
+
+// expandHome replaces a leading "~" the shell left alone, as in `e '~'` or a
+// launcher that passes the text through. Otherwise E would open a new file
+// named "~" in the working directory.
+func expandHome(args []string) []string {
+	home, err := os.UserHomeDir()
+	if err != nil || home == "" {
+		return args
+	}
+	result := make([]string, len(args))
+	for i, arg := range args {
+		switch {
+		case arg == "~":
+			arg = home
+		case strings.HasPrefix(arg, "~/"):
+			arg = filepath.Join(home, arg[2:])
+		}
+		result[i] = arg
+	}
+	return result
 }
 
 func lookupAIKey(provider, endpoint string) string {

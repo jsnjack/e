@@ -12,6 +12,7 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+	"syscall"
 )
 
 // ignoredDirectories are skipped when the project is not a Git repository.
@@ -24,8 +25,11 @@ var ignoredDirectories = map[string]bool{
 }
 
 // Files returns relative file paths beneath root. Discovery is bounded so a
-// generated tree cannot exhaust memory or monopolize disk access.
-func Files(ctx context.Context, root string, limit int) ([]string, error) {
+// generated tree cannot exhaust memory or monopolize disk access. Outside a
+// Git repository, dot folders such as .cache are skipped unless hidden is
+// set, and the walk stays on root's filesystem; inside one, .gitignore
+// decides.
+func Files(ctx context.Context, root string, limit int, hidden bool) ([]string, error) {
 	if limit <= 0 {
 		limit = 100_000
 	}
@@ -33,6 +37,7 @@ func Files(ctx context.Context, root string, limit int) ([]string, error) {
 		return files, nil
 	}
 	files := make([]string, 0, min(limit, 4096))
+	rootDevice, rootOK := device(root)
 	err := filepath.WalkDir(root, func(path string, entry fs.DirEntry, err error) error {
 		if err != nil {
 			if entry != nil && entry.IsDir() {
@@ -46,8 +51,15 @@ func Files(ctx context.Context, root string, limit int) ([]string, error) {
 		default:
 		}
 		if entry.IsDir() {
-			if path != root && ignoredDirectories[entry.Name()] {
+			if path != root && (ignoredDirectories[entry.Name()] || !hidden && strings.HasPrefix(entry.Name(), ".")) {
 				return filepath.SkipDir
+			}
+			// Stay on root's filesystem, like find -xdev: a home folder with
+			// network mounts would otherwise be walked across the network.
+			if path != root && rootOK {
+				if dev, ok := device(path); ok && dev != rootDevice {
+					return filepath.SkipDir
+				}
 			}
 			return nil
 		}
@@ -89,6 +101,15 @@ func gitFiles(ctx context.Context, root string, limit int) ([]string, bool) {
 	}
 	sort.Strings(files)
 	return files, true
+}
+
+// device returns the filesystem device that holds path.
+func device(path string) (uint64, bool) {
+	var stat syscall.Stat_t
+	if err := syscall.Lstat(path, &stat); err != nil {
+		return 0, false
+	}
+	return uint64(stat.Dev), true
 }
 
 // Entry is one child of a directory listed by ListDir.

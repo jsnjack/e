@@ -20,7 +20,7 @@ func TestFilesSkipsRepositoryMetadata(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	files, err := Files(context.Background(), root, 100)
+	files, err := Files(context.Background(), root, 100, false)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -37,7 +37,7 @@ func TestFilesHonorsLimitAndCancellation(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	files, err := Files(context.Background(), root, 2)
+	files, err := Files(context.Background(), root, 2, false)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -46,7 +46,7 @@ func TestFilesHonorsLimitAndCancellation(t *testing.T) {
 	}
 	cancelled, cancel := context.WithCancel(context.Background())
 	cancel()
-	if _, err := Files(cancelled, root, 10); err == nil {
+	if _, err := Files(cancelled, root, 10, false); err == nil {
 		t.Fatal("cancelled discovery returned no error")
 	}
 }
@@ -71,7 +71,7 @@ func TestFilesUsesGitIgnore(t *testing.T) {
 	if out, err := exec.Command("git", "-C", root, "init", "-q").CombinedOutput(); err != nil {
 		t.Fatalf("git init: %v %s", err, out)
 	}
-	files, err := Files(context.Background(), root, 100)
+	files, err := Files(context.Background(), root, 100, false)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -101,5 +101,33 @@ func TestListDirFollowsLinksAndSorts(t *testing.T) {
 	want := []Entry{{"Alpha", true}, {"beta", true}, {"link", true}, {"a.txt", false}}
 	if !reflect.DeepEqual(entries, want) {
 		t.Fatalf("ListDir() = %v, want %v", entries, want)
+	}
+}
+
+func TestFilesSkipsDotFoldersOutsideGit(t *testing.T) {
+	root := t.TempDir()
+	for _, name := range []string{"a.txt", ".cache/big.bin", ".env"} {
+		path := filepath.Join(root, name)
+		if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(path, nil, 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for _, test := range []struct {
+		hidden bool
+		want   []string
+	}{
+		{hidden: false, want: []string{".env", "a.txt"}},
+		{hidden: true, want: []string{".cache/big.bin", ".env", "a.txt"}},
+	} {
+		files, err := Files(context.Background(), root, 100, test.hidden)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !reflect.DeepEqual(files, test.want) {
+			t.Fatalf("Files(hidden=%v) = %v, want %v", test.hidden, files, test.want)
+		}
 	}
 }

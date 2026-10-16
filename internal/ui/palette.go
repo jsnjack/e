@@ -1,16 +1,13 @@
 package ui
 
 import (
-	"path/filepath"
 	"sort"
 	"strings"
 
 	"github.com/diamondburned/gotk4-adwaita/pkg/adw"
 	"github.com/diamondburned/gotk4/pkg/gdk/v4"
 	"github.com/diamondburned/gotk4/pkg/gtk/v4"
-	"github.com/jsnjack/e/internal/activity"
-	"github.com/jsnjack/e/internal/dispatch"
-	"github.com/jsnjack/e/internal/workspace"
+	"github.com/diamondburned/gotk4/pkg/pango"
 )
 
 const maxPaletteResults = 80
@@ -23,7 +20,12 @@ type paletteItem struct {
 	icon     string
 	// complete is the entry text that Tab puts in the path picker.
 	complete string
-	run      func()
+	// path is the absolute file or folder a row opens, for removing
+	// duplicates when picker sources are merged.
+	path string
+	// boost is added to the match score, so recent paths rank higher.
+	boost int
+	run   func()
 	// stay keeps the palette open after run, for steps such as entering a
 	// folder in the path picker.
 	stay bool
@@ -59,8 +61,7 @@ func (w *window) commandPaletteItems() []paletteItem {
 				w.tabs.ClosePage(page)
 			}
 		}},
-		{id: "quick-open", title: "Go: Quick Open", shortcut: "Ctrl+P", run: w.showQuickOpen},
-		{id: "open-path", title: "Go: Open Path…", shortcut: "Ctrl+Alt+O", run: w.showPathPicker},
+		{id: "quick-open", title: "Go: Go to File or Folder", shortcut: "Ctrl+P", run: w.showQuickOpen},
 		{id: "sidebar", title: "View: Toggle Primary Side Bar", shortcut: "Ctrl+B", run: w.toggleSidebar},
 		{id: "markdown-preview", title: "View: Open Markdown Preview", shortcut: "Ctrl+Shift+V", run: func() {
 			if doc := w.active(); doc != nil {
@@ -105,41 +106,6 @@ func (w *window) commandPaletteItems() []paletteItem {
 		}},
 		{id: "preferences", title: "Preferences: Open Settings", shortcut: "Ctrl+,", run: w.openPreferences},
 	}
-}
-
-func (w *window) showQuickOpen() {
-	root := w.projectRoot
-	if root == "" {
-		doc := w.active()
-		if doc == nil || doc.path == "" {
-			w.toast("Open a folder to use Quick Open")
-			return
-		}
-		root = projectRootFor(doc.path, pathExists)
-	}
-	operation := w.activityHub.Begin(activity.Workspace, "Indexing project files")
-	w.showPalette("Quick Open", "Search files by name", func(deliver func([]paletteItem)) {
-		go func() {
-			files, err := workspace.Files(w.ctx, root, 100_000)
-			if err != nil {
-				operation.Fail(err)
-				return
-			}
-			items := make([]paletteItem, 0, len(files))
-			for _, relative := range files {
-				relative := relative
-				items = append(items, paletteItem{
-					title: filepath.Base(relative), detail: filepath.Dir(relative),
-					run: func() { w.openPath(filepath.Join(root, relative)) },
-				})
-			}
-			withSearchKeys(items)
-			dispatch.Main(func() {
-				deliver(items)
-				operation.Finish(activity.Plural(len(items), "file", "files"), "", false)
-			})
-		}()
-	})
 }
 
 func (w *window) showPalette(title, placeholder string, load func(func([]paletteItem))) {
@@ -286,24 +252,40 @@ func nextPaletteIndex(current, count, direction int) int {
 	return min(max(current+direction, 0), count-1)
 }
 
+// filterPaletteItems ranks items for query, best first. Spaces separate
+// words: every word must match on its own, and the scores add up, so
+// "dow otter" finds Downloads/bright-otter.json without matching letters
+// scattered across unrelated names.
 func filterPaletteItems(items []paletteItem, query string, limit int) []paletteItem {
 	type match struct {
 		item  paletteItem
 		score int
 	}
-	query = strings.TrimSpace(query)
-	if query == "" {
+	words := strings.Fields(strings.ToLower(query))
+	if len(words) == 0 {
 		return items[:min(len(items), max(limit, 0))]
 	}
-	queryRunes := []rune(strings.ToLower(query))
+	wordRunes := make([][]rune, len(words))
+	for i, word := range words {
+		wordRunes[i] = []rune(word)
+	}
 	matches := make([]match, 0, min(len(items), 1024))
 	for _, item := range items {
 		key := item.key
 		if key == nil {
 			key = []rune(strings.ToLower(item.title + " " + item.detail))
 		}
-		if score := fuzzyScoreRunes(queryRunes, key); score >= 0 {
-			matches = append(matches, match{item: item, score: score})
+		total := item.boost
+		for _, word := range wordRunes {
+			score := fuzzyScoreRunes(word, key)
+			if score < 0 {
+				total = -1
+				break
+			}
+			total += score
+		}
+		if total >= 0 {
+			matches = append(matches, match{item: item, score: total})
 		}
 	}
 	sort.SliceStable(matches, func(i, j int) bool { return matches[i].score > matches[j].score })
@@ -330,13 +312,18 @@ func paletteRow(item paletteItem) *gtk.ListBoxRow {
 		content.Append(icon)
 	}
 	labels := gtk.NewBox(gtk.OrientationVertical, 2)
+	labels.SetHExpand(true)
+	// Long names are cut in the middle; without this a row's natural width
+	// would stretch the dialog past the window.
 	title := gtk.NewLabel(item.title)
 	title.SetXAlign(0)
 	title.SetHExpand(true)
+	title.SetEllipsize(pango.EllipsizeMiddle)
 	labels.Append(title)
 	if item.detail != "" && item.detail != "." {
 		detail := gtk.NewLabel(item.detail)
 		detail.SetXAlign(0)
+		detail.SetEllipsize(pango.EllipsizeStart)
 		detail.AddCSSClass("dim-label")
 		detail.AddCSSClass("caption")
 		labels.Append(detail)
@@ -356,11 +343,28 @@ func fuzzyScore(query, candidate string) int {
 	return fuzzyScoreRunes([]rune(strings.ToLower(query)), []rune(strings.ToLower(candidate)))
 }
 
+// Scores for one word. An unbroken match beats any scattered one, and one
+// that starts a word or path segment beats one in the middle.
+const (
+	unbrokenRuneScore = 15
+	wordStartBonus    = 20
+)
+
 func fuzzyScoreRunes(queryRunes, candidateRunes []rune) int {
 	if len(queryRunes) == 0 {
 		return 0
 	}
-	score, previous, searchFrom := 0, -2, 0
+	if at := unbrokenMatch(candidateRunes, queryRunes); at >= 0 {
+		score := unbrokenRuneScore * len(queryRunes)
+		if wordStart(candidateRunes, at) {
+			score += wordStartBonus
+		}
+		return score - len(candidateRunes)/8
+	}
+	// A scattered match may start at most one piece in the middle of a word;
+	// "mdp" matches "Markdown Preview", but "otter" spread through
+	// "tickets_by_version" does not.
+	score, previous, searchFrom, midWord := 0, -2, 0, 0
 	for _, wanted := range queryRunes {
 		position := -1
 		for index := searchFrom; index < len(candidateRunes); index++ {
@@ -373,13 +377,48 @@ func fuzzyScoreRunes(queryRunes, candidateRunes []rune) int {
 			return -1
 		}
 		score += 5
-		if position == previous+1 {
+		switch {
+		case position == previous+1:
 			score += 8
-		}
-		if position == 0 || strings.ContainsRune(" /_-:.", candidateRunes[position-1]) {
+		case wordStart(candidateRunes, position):
 			score += 6
+		default:
+			if midWord++; midWord > 1 {
+				return -1
+			}
 		}
 		previous, searchFrom = position, position+1
 	}
 	return score - len(candidateRunes)/8
+}
+
+func wordStart(text []rune, at int) bool {
+	return at == 0 || strings.ContainsRune(" /_-:.", text[at-1])
+}
+
+// unbrokenMatch returns where part appears in text, preferring a word
+// start, or -1.
+func unbrokenMatch(text, part []rune) int {
+	found := -1
+	for start := 0; start+len(part) <= len(text); start++ {
+		if !runesAt(text, part, start) {
+			continue
+		}
+		if wordStart(text, start) {
+			return start
+		}
+		if found < 0 {
+			found = start
+		}
+	}
+	return found
+}
+
+func runesAt(text, part []rune, start int) bool {
+	for i, r := range part {
+		if text[start+i] != r {
+			return false
+		}
+	}
+	return true
 }

@@ -304,7 +304,7 @@ func TestProjectTreeRuntime(t *testing.T) {
 		t.Fatal("opening the same root rebuilt the tree")
 	}
 
-	if w.mainStack.VisibleChildName() != "empty" || w.empty.title.Text() != "project" || !w.empty.quickOpen.Visible() {
+	if w.mainStack.VisibleChildName() != "empty" || w.empty.title.Text() != "project" {
 		t.Fatalf("empty state = %q titled %q", w.mainStack.VisibleChildName(), w.empty.title.Text())
 	}
 	saveScreenshot(t, w.toastOverlay, "empty-state.png")
@@ -344,8 +344,10 @@ func TestProjectTreeRuntime(t *testing.T) {
 // it, and finds the folder again among recent paths.
 func checkPathPicker(t *testing.T, w *window, root, sub string) {
 	t.Helper()
+	// The picker lists home; keep the real one out of the results.
+	t.Setenv("HOME", filepath.Dir(root))
 	waitForUI(t, func() bool { return w.recentLoaded })
-	w.showPathPicker()
+	w.showQuickOpen()
 	p := w.lastPalette
 	p.entry.SetText(sub + "/inn")
 	waitForUI(t, func() bool {
@@ -371,7 +373,7 @@ func checkPathPicker(t *testing.T, w *window, root, sub string) {
 		return doc != nil && p.closed
 	})
 
-	w.showPathPicker()
+	w.showQuickOpen()
 	p = w.lastPalette
 	p.entry.SetText("project")
 	waitForUI(t, func() bool {
@@ -379,6 +381,33 @@ func checkPathPicker(t *testing.T, w *window, root, sub string) {
 		return ok && item.title == "project" && item.icon == "folder-symbolic"
 	})
 	p.dialog.Close()
+
+	// Quick Open browses a folder path relative to the project.
+	w.showQuickOpen()
+	p = w.lastPalette
+	p.entry.SetText("sub/inn")
+	waitForUI(t, func() bool { item, ok := p.selected(); return ok && item.title == "inner.txt" })
+	p.key(gdk.KEY_Tab, 0)
+	if got := p.entry.Text(); got != "sub/inner.txt" {
+		t.Fatalf("Quick Open Tab completed %q", got)
+	}
+	p.entry.SetText("sub/")
+	if p.key(gdk.KEY_BackSpace, 0); p.entry.Text() != "" {
+		t.Fatalf("Backspace from sub/ left %q", p.entry.Text())
+	}
+	p.entry.SetText("ub/inn")
+	waitForUI(t, func() bool { item, ok := p.selected(); return ok && item.title == "inner.txt" && item.detail == "sub" })
+	p.entry.SetText("su inn")
+	waitForUI(t, func() bool { item, ok := p.selected(); return ok && item.title == "inner.txt" })
+	p.dialog.Close()
+
+	// The fuzzy folder walk picks "sub" for "su", then "inner.txt" in it.
+	walker := w.newPathBrowser(w.newPalette("Walk", ""), "", root, func() {})
+	waitForUI(t, func() bool {
+		items := walker.fuzzyPath(root, []string{"su", "inn"})
+		return len(items) > 0 && items[0].title == "inner.txt"
+	})
+
 	waitForUI(t, func() bool {
 		saved, err := recent.Load(w.recentPath())
 		return err == nil && len(saved) >= 2

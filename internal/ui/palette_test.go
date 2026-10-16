@@ -1,6 +1,8 @@
 package ui
 
 import (
+	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/diamondburned/gotk4/pkg/gdk/v4"
@@ -98,5 +100,38 @@ func TestCommandPaletteRegistry(t *testing.T) {
 	}
 	if matches := filterPaletteItems(items, "new text file", maxPaletteResults); len(matches) == 0 || matches[0].id != "new" {
 		t.Fatalf("new text file search selected %#v", matches)
+	}
+}
+
+func TestFuzzyRanking(t *testing.T) {
+	if fuzzyScore("otter", "trace-bright-otter.json.gz") <= fuzzyScore("otter", "Screenshot at 14-58-37 Alert rules.png") {
+		t.Fatal("an unbroken match should rank above a scattered one")
+	}
+	items := withSearchKeys([]paletteItem{{title: "banana.txt", detail: "Downloads"}, {title: "notes.txt", detail: "Documents"}})
+	if got := filterPaletteItems(items, "bana dow", 10); len(got) != 1 || got[0].title != "banana.txt" {
+		t.Fatalf("spaces in the query should separate words, got %+v", got)
+	}
+}
+
+// TestFuzzyWordsRankUnbrokenMatches is the case from a screenshot: letters
+// of "otter" scattered through other names ranked above the real file.
+func TestFuzzyWordsRankUnbrokenMatches(t *testing.T) {
+	var items []paletteItem
+	for _, relative := range []string{
+		"Downloads/tickets_by_version.csv",
+		"fsmounts/cc/jsn/cobro/meriyah/test262/download-test262.mjs",
+		"fsmounts/cc/jsn/cobro/tests/cobro_selenium/test_downloads.py",
+		"Downloads/trace-20260929-bright-otter-39c499b9.json.gz",
+		"Downloads/Screenshot 2026-03-30 at 14-58-37 Alert rules - Alerting - Grafana.png",
+	} {
+		items = append(items, paletteItem{title: relative, key: []rune(strings.ToLower(filepath.Base(relative) + " " + relative))})
+	}
+	got := filterPaletteItems(items, "dow otter", 10)
+	if len(got) != 1 || got[0].title != "Downloads/trace-20260929-bright-otter-39c499b9.json.gz" {
+		titles := make([]string, len(got))
+		for i, item := range got {
+			titles[i] = item.title
+		}
+		t.Fatalf("dow otter = %q", titles)
 	}
 }
