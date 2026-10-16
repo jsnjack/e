@@ -56,9 +56,8 @@ func Run(options Options, paths []string) error {
 		for _, file := range files {
 			win.openPath(file.Path())
 		}
-		if len(win.documents) == 0 {
-			win.newDocument(nil)
-		}
+		// `e <folder>` with no restored tabs shows the empty state, which
+		// offers Quick Open for that folder, instead of an untitled file.
 	})
 	argv := []string{"e"}
 	argv = append(argv, paths...)

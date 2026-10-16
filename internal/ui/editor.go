@@ -95,6 +95,8 @@ type editorDocument struct {
 	watching   bool
 	diskWarn   bool
 
+	diff diffState
+
 	multiCursors []multiCursor
 	multiTag     *gtk.TextTag
 	// verticalX is the column, in buffer pixels, kept while adding cursors
@@ -219,6 +221,7 @@ func (d *editorDocument) connectSignals() {
 		}
 		d.revision++
 		d.window.scheduleSessionSave()
+		d.scheduleDiff()
 		if d.transformCancel != nil {
 			d.transformCancel()
 			d.transformCancel = nil
@@ -418,6 +421,7 @@ func (d *editorDocument) load(path string, cursor int) {
 				operation.Finish(humanByteCount(len(file.Text)), "", false)
 				d.startLSP()
 				d.startExternalWatch()
+				d.refreshDiffBase()
 			})
 		})
 	}()
@@ -508,6 +512,7 @@ func (d *editorDocument) attachRestoredFile(savedModTime int64) {
 			}
 			d.startLSP()
 			d.startExternalWatch()
+			d.refreshDiffBase()
 		})
 	}()
 }
@@ -663,6 +668,7 @@ func (d *editorDocument) runNextSave() {
 				d.applyPathChange(request.path, request.props)
 			} else {
 				d.path = request.path
+				d.refreshDiffBase()
 			}
 			d.diskWarn = false
 			for _, queued := range d.saveQueue {
@@ -750,6 +756,7 @@ func (d *editorDocument) applyPathChange(path string, props editorconfig.Propert
 	d.view.SetLanguage(path, "")
 	d.updatePresentation()
 	d.startLSP()
+	d.refreshDiffBase()
 }
 
 func (d *editorDocument) confirmOverwrite(request *saveRequest) {
@@ -1333,6 +1340,7 @@ func (d *editorDocument) close() {
 		}
 	}
 	d.saveQueue = nil
+	d.stopDiff()
 	d.dismissCompletion()
 	if d.completionTimer != nil {
 		d.completionTimer.Stop()

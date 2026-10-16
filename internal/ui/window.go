@@ -16,9 +16,11 @@ import (
 	"github.com/diamondburned/gotk4/pkg/gtk/v4"
 	"github.com/jsnjack/e/internal/activity"
 	"github.com/jsnjack/e/internal/ai"
+	"github.com/jsnjack/e/internal/config"
 	"github.com/jsnjack/e/internal/dispatch"
 	"github.com/jsnjack/e/internal/document"
 	"github.com/jsnjack/e/internal/logging"
+	"github.com/jsnjack/e/internal/recent"
 )
 
 type window struct {
@@ -40,6 +42,8 @@ type window struct {
 	replaceEntry        *gtk.Entry
 	matchLabel          *gtk.Label
 	content             *gtk.Paned
+	mainStack           *gtk.Stack
+	empty               *emptyState
 	sidebar             *gtk.ScrolledWindow
 	sidebarBody         *gtk.Box
 	sidebarToggle       *gtk.Button
@@ -50,6 +54,8 @@ type window struct {
 	ctrlKTimer          glib.SourceHandle
 	preferences         *adw.PreferencesDialog
 	preferencesApplying bool
+	// lastPalette is the newest picker dialog, for runtime tests.
+	lastPalette *palette
 
 	documents   map[*adw.TabPage]*editorDocument
 	lspSessions map[string]*lspSession
@@ -66,6 +72,44 @@ type window struct {
 	sessionTimer   glib.SourceHandle
 	sessionClosed  bool
 	forceClose     bool
+
+	// configMu and configWritten drop a config write that is older than one
+	// already on disk, like the session writes above.
+	configMu      sync.Mutex
+	configSeq     uint64
+	configWritten uint64
+
+	// recent feeds the path picker; recentMu and recentWritten order its
+	// background writes.
+	recent        []recent.Entry
+	recentLoaded  bool
+	recentMu      sync.Mutex
+	recentSeq     uint64
+	recentWritten uint64
+}
+
+// applyConfig makes cfg current at once and writes it to disk in the
+// background. It is for small settings changed outside Preferences.
+func (w *window) applyConfig(cfg config.Config) {
+	w.options.Config = cfg
+	w.configSeq++
+	sequence, path := w.configSeq, w.options.ConfigPath
+	if path == "" {
+		return
+	}
+	go func() {
+		w.configMu.Lock()
+		defer w.configMu.Unlock()
+		if sequence <= w.configWritten {
+			return
+		}
+		if err := config.Save(path, cfg); err != nil {
+			slog.Warn("save config", "err", err)
+			dispatch.Main(func() { w.toast("Settings weren’t saved: " + err.Error()) })
+			return
+		}
+		w.configWritten = sequence
+	}()
 }
 
 // sessionSaveDelaySeconds bounds how much unsaved text a crash can lose.
@@ -87,6 +131,7 @@ func newWindow(app *adw.Application, options Options) *window {
 	w.build()
 	w.registerActions()
 	w.setCompleter(options.Completer)
+	w.loadRecent()
 	return w
 }
 
@@ -103,6 +148,11 @@ func (w *window) build() {
 		if !w.win.IsActive() {
 			w.clearPendingChord()
 			preserveWindowContrast(&w.win.Widget)
+			return
+		}
+		// A commit or `git add` in another program moves the diff base.
+		for _, doc := range w.documents {
+			doc.refreshDiffBase()
 		}
 	})
 	logging.Trace("ui: application window ready")
@@ -132,9 +182,12 @@ func (w *window) build() {
 	menu := gio.NewMenu()
 	menu.Append("Command Palette…", "win.command-palette")
 	menu.Append("Quick Open…", "win.quick-open")
+	menu.Append("Open Path…", "win.open-path")
+	menu.Append("Open Folder…", "win.open-folder")
 	menu.Append("Save As…", "win.save-as")
 	menu.Append("Find and Replace", "win.replace")
 	menu.Append("Markdown Preview", "win.markdown-preview")
+	menu.Append("Show Changes in gdiff", "win.show-changes")
 	menu.Append("Transform Selection with AI…", "win.ai-transform")
 	menu.Append("Preferences", "win.preferences")
 	menu.Append("Keyboard Shortcuts", "win.shortcuts")
@@ -161,6 +214,13 @@ func (w *window) build() {
 	w.tabBar.SetAutohide(true)
 	w.tabs.ConnectClosePage(w.closePage)
 	w.tabs.Connect("notify::selected-page", w.selectedPageChanged)
+	w.tabs.NotifyProperty("n-pages", w.updateEmptyState)
+	w.empty = newEmptyState()
+	w.mainStack = gtk.NewStack()
+	w.mainStack.SetTransitionType(gtk.StackTransitionTypeCrossfade)
+	w.mainStack.SetTransitionDuration(160)
+	w.mainStack.AddNamed(w.tabs, "tabs")
+	w.mainStack.AddNamed(w.empty.root, "empty")
 	logging.Trace("ui: tabs ready")
 
 	w.searchBar = gtk.NewSearchBar()
@@ -231,7 +291,7 @@ func (w *window) build() {
 	w.content = gtk.NewPaned(gtk.OrientationHorizontal)
 	w.content.AddCSSClass("editor-content")
 	w.content.SetStartChild(w.sidebar)
-	w.content.SetEndChild(w.tabs)
+	w.content.SetEndChild(w.mainStack)
 	w.content.SetResizeStartChild(false)
 	w.content.SetResizeEndChild(true)
 	w.content.SetShrinkStartChild(true)
@@ -239,6 +299,7 @@ func (w *window) build() {
 	w.content.SetWideHandle(true)
 	w.content.SetPosition(w.sidebarWidth)
 	toolbar.SetContent(w.content)
+	w.updateEmptyState()
 	w.activity.mount(toolbar)
 	w.activity.subscribe(w.ctx)
 	w.toastOverlay = adw.NewToastOverlay()
@@ -262,6 +323,9 @@ func (w *window) registerActions() {
 	logging.Trace("ui: register actions")
 	w.action("new", func() { w.newDocument(nil) }, "<Control>n")
 	w.action("open", w.chooseOpen, "<Control>o")
+	w.action("open-folder", w.chooseFolder)
+	w.action("open-path", w.showPathPicker, "<Control><Alt>o")
+	w.action("show-changes", w.showChangesInGdiff, "<Control><Alt>d")
 	w.action("command-palette", w.showCommandPalette, "<Control><Shift>p")
 	w.action("quick-open", w.showQuickOpen, "<Control>p")
 	w.action("save", func() {
@@ -374,6 +438,10 @@ func (w *window) keyPressed(keyval, _ uint, state gdk.ModifierType) bool {
 		w.clearPendingChord()
 		if ctrl && !shift && !alt && !super && lower == gdk.KEY_s {
 			w.showShortcuts()
+			return true
+		}
+		if ctrl && !shift && !alt && !super && lower == gdk.KEY_o {
+			w.chooseFolder()
 			return true
 		}
 	}
@@ -599,9 +667,13 @@ func (w *window) documentForPath(path string) (*editorDocument, *adw.TabPage) {
 }
 
 func (w *window) openPath(path string) {
-	if info, err := os.Stat(path); err == nil && info.IsDir() {
+	info, err := os.Stat(path)
+	if err == nil && info.IsDir() {
 		w.setProjectRoot(path)
 		return
+	}
+	if err == nil {
+		w.rememberPath(path, false)
 	}
 	if doc, page := w.documentForPath(path); doc != nil {
 		w.tabs.SetSelectedPage(page)
@@ -632,6 +704,21 @@ func (w *window) chooseOpen() {
 				w.openPath(file.Path())
 			}
 		}
+	})
+}
+
+func (w *window) chooseFolder() {
+	dialog := gtk.NewFileDialog()
+	dialog.SetTitle("Open Folder")
+	if folder := w.dialogFolder(); folder != "" {
+		dialog.SetInitialFolder(gio.NewFileForPath(folder))
+	}
+	dialog.SelectFolder(w.ctx, &w.win.Window, func(result gio.AsyncResulter) {
+		folder, err := dialog.SelectFolderFinish(result)
+		if err != nil || folder == nil {
+			return
+		}
+		w.setProjectRoot(folder.Path())
 	})
 }
 
@@ -698,9 +785,6 @@ func (w *window) closePage(page *adw.TabPage) bool {
 			delete(w.documents, doc.page)
 		}
 		w.tabs.ClosePageFinish(page, close)
-		if close && len(w.documents) == 0 {
-			w.newDocument(nil)
-		}
 		if close {
 			w.scheduleSessionSave()
 		}
@@ -767,7 +851,7 @@ func (w *window) updateTitle(doc *editorDocument) {
 	w.activity.updateDocument(doc)
 	if doc == nil {
 		w.title.SetTitle("E")
-		w.title.SetSubtitle("")
+		w.title.SetSubtitle(w.projectRoot)
 		return
 	}
 	w.title.SetTitle(doc.title())
@@ -871,6 +955,55 @@ func loadCSS() {
 .project-entry-open image { -gtk-icon-size: 18px; }
 .project-entry-label { font-weight: 400; }
 .project-folder .project-entry-label { font-weight: 500; }
+.project-tree-footer {
+  padding: 6px 8px 4px 10px;
+  border-top: 1px solid alpha(@window_fg_color, .08);
+  font-size: .9em;
+}
+.empty-state {
+  background-color: @view_bg_color;
+  background-image: radial-gradient(circle farthest-side at 50% 34%, alpha(@accent_bg_color, .13), alpha(@accent_bg_color, 0));
+}
+.empty-hero {
+  padding: 22px;
+  border-radius: 34px;
+  background-image: linear-gradient(160deg, alpha(@accent_bg_color, .24), alpha(@accent_bg_color, .05));
+  border: 1px solid alpha(@accent_color, .18);
+  box-shadow: 0 18px 48px -12px alpha(@accent_bg_color, .45), inset 0 1px alpha(white, .10);
+}
+.empty-monogram {
+  min-width: 96px;
+  min-height: 96px;
+  font-size: 64pt;
+  font-weight: 800;
+  color: @accent_color;
+}
+.empty-title { font-size: 24pt; font-weight: 800; letter-spacing: -1px; }
+.empty-subtitle { font-family: monospace; font-size: .92em; color: alpha(@window_fg_color, .55); }
+.empty-actions {
+  padding: 6px;
+  border-radius: 16px;
+  background: alpha(@window_fg_color, .035);
+  border: 1px solid alpha(@window_fg_color, .08);
+}
+.empty-action { padding: 9px 12px; border-radius: 10px; font-weight: 500; transition: background 120ms ease-out; }
+.empty-action image { color: alpha(@window_fg_color, .6); transition: color 120ms ease-out; }
+.empty-action:hover, .empty-action:focus-visible { background: alpha(@accent_bg_color, .12); }
+.empty-action:hover image, .empty-action:focus-visible image { color: @accent_color; }
+.empty-keycap {
+  min-width: 14px;
+  padding: 1px 6px;
+  border-radius: 6px;
+  font-family: monospace;
+  font-size: .78em;
+  font-weight: 600;
+  color: alpha(@window_fg_color, .72);
+  background: alpha(@window_fg_color, .06);
+  border: 1px solid alpha(@window_fg_color, .12);
+  box-shadow: inset 0 -1px alpha(@window_fg_color, .14);
+}
+.empty-keygap { font-size: .75em; color: alpha(@window_fg_color, .4); margin: 0 2px; }
+.empty-tip { font-size: .85em; color: alpha(@window_fg_color, .42); }
 .status-bar {
   min-height: 24px;
   padding: 2px 7px 2px 10px;

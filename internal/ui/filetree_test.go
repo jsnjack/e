@@ -3,6 +3,8 @@ package ui
 import (
 	"context"
 	"fmt"
+	"image"
+	"image/png"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -15,6 +17,8 @@ import (
 	"github.com/diamondburned/gotk4/pkg/gtk/v4"
 	"github.com/jsnjack/e/internal/ai"
 	"github.com/jsnjack/e/internal/config"
+	"github.com/jsnjack/e/internal/gtktest"
+	"github.com/jsnjack/e/internal/recent"
 )
 
 func TestSafeProjectTargetRejectsEscape(t *testing.T) {
@@ -94,7 +98,7 @@ func TestReadProjectDirSortsAndSkipsMetadata(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	entries, err := readProjectDir(root)
+	entries, err := readProjectDir(root, true)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -107,6 +111,15 @@ func TestReadProjectDirSortsAndSkipsMetadata(t *testing.T) {
 	}
 	if !equalProjectEntries(entries, want) {
 		t.Fatalf("readProjectDir = %v, want %v", entries, want)
+	}
+
+	entries, err = readProjectDir(root, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want = []projectEntry{want[0], want[1], want[3], want[4]}
+	if !equalProjectEntries(entries, want) {
+		t.Fatalf("readProjectDir without hidden = %v, want %v", entries, want)
 	}
 }
 
@@ -289,5 +302,113 @@ func TestProjectTreeRuntime(t *testing.T) {
 	w.setProjectRoot(root)
 	if w.projectTree != tree {
 		t.Fatal("opening the same root rebuilt the tree")
+	}
+
+	if w.mainStack.VisibleChildName() != "empty" || w.empty.title.Text() != "project" || !w.empty.quickOpen.Visible() {
+		t.Fatalf("empty state = %q titled %q", w.mainStack.VisibleChildName(), w.empty.title.Text())
+	}
+	saveScreenshot(t, w.toastOverlay, "empty-state.png")
+
+	hidden := filepath.Join(root, ".hidden")
+	if err := os.WriteFile(hidden, nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	tree.refresh()
+	waitForUI(t, func() bool { return rowFor(added) == nil && rowFor(filepath.Join(sub, "second.txt")) != nil })
+	if rowFor(hidden) != nil {
+		t.Fatal("hidden file listed with the switch off")
+	}
+	tree.hidden.SetActive(true)
+	waitForUI(t, func() bool { return rowFor(hidden) != nil })
+	if row := rowFor(sub); row == nil || !row.Expanded() {
+		t.Fatal("showing hidden files collapsed an expanded folder")
+	}
+	waitForUI(t, func() bool {
+		saved, err := config.Load(w.options.ConfigPath)
+		return err == nil && saved.Editor.ShowHiddenFiles
+	})
+	tree.hidden.SetActive(false)
+	waitForUI(t, func() bool { return rowFor(hidden) == nil })
+
+	doc := w.newDocument(nil)
+	if w.mainStack.VisibleChildName() != "tabs" {
+		t.Fatal("opening a document kept the empty state")
+	}
+	w.tabs.ClosePage(doc.page)
+	waitForUI(t, func() bool { return w.mainStack.VisibleChildName() == "empty" && len(w.documents) == 0 })
+
+	checkPathPicker(t, w, root, sub)
+}
+
+// checkPathPicker browses into a folder, completes a file with Tab, opens
+// it, and finds the folder again among recent paths.
+func checkPathPicker(t *testing.T, w *window, root, sub string) {
+	t.Helper()
+	waitForUI(t, func() bool { return w.recentLoaded })
+	w.showPathPicker()
+	p := w.lastPalette
+	p.entry.SetText(sub + "/inn")
+	waitForUI(t, func() bool {
+		item, ok := p.selected()
+		return ok && item.title == "inner.txt"
+	})
+	p.key(gdk.KEY_Tab, 0)
+	if got := p.entry.Text(); got != pathQueryText(filepath.Join(sub, "inner.txt"), false) {
+		t.Fatalf("Tab completed %q", got)
+	}
+	p.entry.SetText(root + "/")
+	waitForUI(t, func() bool { item, ok := p.selected(); return ok && item.icon == "folder-open-symbolic" })
+	saveScreenshot(t, p.dialog, "path-picker.png")
+	p.entry.SetText(sub + "/")
+	if p.key(gdk.KEY_BackSpace, 0); p.entry.Text() != pathQueryText(root, true) {
+		t.Fatalf("Backspace went to %q", p.entry.Text())
+	}
+	p.entry.SetText(sub + "/inn")
+	waitForUI(t, func() bool { item, ok := p.selected(); return ok && item.title == "inner.txt" })
+	p.entry.Emit("activate")
+	waitForUI(t, func() bool {
+		doc, _ := w.documentForPath(filepath.Join(sub, "inner.txt"))
+		return doc != nil && p.closed
+	})
+
+	w.showPathPicker()
+	p = w.lastPalette
+	p.entry.SetText("project")
+	waitForUI(t, func() bool {
+		item, ok := p.selected()
+		return ok && item.title == "project" && item.icon == "folder-symbolic"
+	})
+	p.dialog.Close()
+	waitForUI(t, func() bool {
+		saved, err := recent.Load(w.recentPath())
+		return err == nil && len(saved) >= 2
+	})
+}
+
+// saveScreenshot writes the widget as a PNG when E_TEST_SCREENSHOTS names a
+// folder, for reviewing designs by eye.
+func saveScreenshot(t *testing.T, widget gtk.Widgetter, name string) {
+	t.Helper()
+	dir := os.Getenv("E_TEST_SCREENSHOTS")
+	if dir == "" {
+		return
+	}
+	waitFrames(t, widget, 3)
+	pixels, stride, err := gtktest.Render(widget)
+	if err != nil {
+		t.Fatal(err)
+	}
+	height := len(pixels) / stride
+	img := &image.RGBA{Pix: pixels, Stride: stride, Rect: image.Rect(0, 0, stride/4, height)}
+	file, err := os.Create(filepath.Join(dir, name))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := png.Encode(file, img); err != nil {
+		_ = file.Close()
+		t.Fatal(err)
+	}
+	if err := file.Close(); err != nil {
+		t.Fatal(err)
 	}
 }

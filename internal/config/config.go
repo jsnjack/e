@@ -49,6 +49,8 @@ type Editor struct {
 	SpellCheck   bool `toml:"spell_check"`
 	TabWidth     int  `toml:"tab_width"`
 	InsertSpaces bool `toml:"insert_spaces"`
+	// ShowHiddenFiles lists dot files in the project sidebar.
+	ShowHiddenFiles bool `toml:"show_hidden_files"`
 }
 
 // Config is E's complete configuration file.

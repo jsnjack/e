@@ -80,3 +80,26 @@ func TestFilesUsesGitIgnore(t *testing.T) {
 		t.Fatalf("Files() = %v, want %v", files, want)
 	}
 }
+
+func TestListDirFollowsLinksAndSorts(t *testing.T) {
+	root := t.TempDir()
+	for _, dir := range []string{"beta", "Alpha"} {
+		if err := os.Mkdir(filepath.Join(root, dir), 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := os.WriteFile(filepath.Join(root, "a.txt"), nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(filepath.Join(root, "beta"), filepath.Join(root, "link")); err != nil {
+		t.Fatal(err)
+	}
+	entries, err := ListDir(root, 100)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := []Entry{{"Alpha", true}, {"beta", true}, {"link", true}, {"a.txt", false}}
+	if !reflect.DeepEqual(entries, want) {
+		t.Fatalf("ListDir() = %v, want %v", entries, want)
+	}
+}

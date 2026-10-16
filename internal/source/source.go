@@ -63,9 +63,23 @@ typedef struct {
   int *offsets;
 } CaretSet;
 
+// Change marks against the file's base version, as runs of lines. They are
+// drawn as bars in the left text margin, for visible lines only.
+typedef struct {
+  int line, count, kind;
+} DiffMark;
+
+typedef struct {
+  int count;
+  DiffMark *marks;
+} DiffSet;
+
+enum { DIFF_ADDED = 1, DIFF_MODIFIED = 2, DIFF_DELETED = 3 };
+
 static GType ghost_view_type;
 static GQuark ghost_quark;
 static GQuark caret_quark;
+static GQuark diff_quark;
 static void (*parent_snapshot_layer)(GtkTextView *, GtkTextViewLayer, GtkSnapshot *);
 
 static void ghost_free(gpointer data) {
@@ -108,9 +122,62 @@ static void snapshot_carets(GtkTextView *view, GtkSnapshot *snapshot) {
   }
 }
 
+static void diff_free(gpointer data) {
+  DiffSet *set = data;
+  g_free(set->marks);
+  g_free(set);
+}
+
+static void snapshot_diff(GtkTextView *view, GtkSnapshot *snapshot) {
+  DiffSet *set = g_object_get_qdata(G_OBJECT(view), diff_quark);
+  if (!set || set->count == 0) return;
+  GtkTextBuffer *buffer = gtk_text_view_get_buffer(view);
+  GdkRectangle visible;
+  gtk_text_view_get_visible_rect(view, &visible);
+  GtkTextIter top, bottom;
+  gtk_text_view_get_iter_at_location(view, &top, visible.x, visible.y);
+  gtk_text_view_get_iter_at_location(view, &bottom, visible.x, visible.y + visible.height);
+  int first = gtk_text_iter_get_line(&top);
+  int last = gtk_text_iter_get_line(&bottom);
+  int lines = gtk_text_buffer_get_line_count(buffer);
+  static const GdkRGBA added = {0.18f, 0.76f, 0.49f, 0.95f};
+  static const GdkRGBA modified = {0.21f, 0.52f, 0.89f, 0.95f};
+  static const GdkRGBA deleted = {0.88f, 0.11f, 0.14f, 0.95f};
+  for (int i = 0; i < set->count; i++) {
+    DiffMark mark = set->marks[i];
+    GtkTextIter iter;
+    int y, height;
+    if (mark.kind == DIFF_DELETED) {
+      if (mark.line < first || mark.line > last + 1) continue;
+      // The removed lines sat just above mark.line, or below the last line.
+      gboolean end = mark.line >= lines;
+      gtk_text_buffer_get_iter_at_line(buffer, &iter, end ? lines - 1 : mark.line);
+      gtk_text_view_get_line_yrange(view, &iter, &y, &height);
+      int edge = end ? y + height : y;
+      gtk_snapshot_append_color(snapshot, &deleted, &GRAPHENE_RECT_INIT(visible.x, edge - 2, 7, 4));
+      continue;
+    }
+    int start = MAX(mark.line, first);
+    int stop = MIN(mark.line + mark.count - 1, MIN(last, lines - 1));
+    if (start > stop) continue;
+    gtk_text_buffer_get_iter_at_line(buffer, &iter, start);
+    gtk_text_view_get_line_yrange(view, &iter, &y, &height);
+    int bottom_y = y + height;
+    if (stop != start) {
+      int stop_y;
+      gtk_text_buffer_get_iter_at_line(buffer, &iter, stop);
+      gtk_text_view_get_line_yrange(view, &iter, &stop_y, &height);
+      bottom_y = stop_y + height;
+    }
+    gtk_snapshot_append_color(snapshot, mark.kind == DIFF_ADDED ? &added : &modified,
+                              &GRAPHENE_RECT_INIT(visible.x, y, 3, bottom_y - y));
+  }
+}
+
 static void ghost_snapshot_layer(GtkTextView *view, GtkTextViewLayer layer, GtkSnapshot *snapshot) {
   if (parent_snapshot_layer) parent_snapshot_layer(view, layer, snapshot);
   if (layer != GTK_TEXT_VIEW_LAYER_ABOVE_TEXT) return;
+  snapshot_diff(view, snapshot);
   snapshot_carets(view, snapshot);
   GhostText *ghost = g_object_get_qdata(G_OBJECT(view), ghost_quark);
   if (!ghost || !ghost->layout) return;
@@ -135,6 +202,7 @@ static GType ghost_view_get_type(void) {
   if (!query.type) return 0;
   ghost_quark = g_quark_from_static_string("e-ghost-text");
   caret_quark = g_quark_from_static_string("e-secondary-carets");
+  diff_quark = g_quark_from_static_string("e-diff-marks");
   ghost_view_type = g_type_register_static_simple(parent_type(), "EGhostSourceView",
                                                   query.class_size, ghost_class_init,
                                                   query.instance_size, NULL, 0);
@@ -264,6 +332,22 @@ static gboolean bridge_set_carets(GtkTextView *view, const int *offsets, int cou
   return TRUE;
 }
 
+static gboolean bridge_set_diff(GtkTextView *view, const int *values, int count) {
+  if (!ghost_view_type || !G_TYPE_CHECK_INSTANCE_TYPE(view, ghost_view_type)) return FALSE;
+  DiffSet *set = NULL;
+  if (count > 0) {
+    set = g_new0(DiffSet, 1);
+    set->count = count;
+    set->marks = g_new0(DiffMark, count);
+    for (int i = 0; i < count; i++) {
+      set->marks[i] = (DiffMark){values[3 * i], values[3 * i + 1], values[3 * i + 2]};
+    }
+  }
+  g_object_set_qdata_full(G_OBJECT(view), diff_quark, set, set ? diff_free : NULL);
+  gtk_widget_queue_draw(GTK_WIDGET(view));
+  return TRUE;
+}
+
 static PangoLayout *bridge_layout(uintptr_t pointer) {
   return (PangoLayout *)pointer;
 }
@@ -369,6 +453,29 @@ func (v *View) SetCarets(offsets []int) bool {
 		defer runtime.KeepAlive(native)
 	}
 	ok := C.bridge_set_carets(v.native(), pointer, C.int(len(offsets))) != 0
+	runtime.KeepAlive(v)
+	return ok
+}
+
+// DiffMark is one run of changed lines, in 0-based buffer lines. Kind is 1
+// for added, 2 for modified, and 3 for lines deleted just above Line.
+type DiffMark struct {
+	Line, Count, Kind int
+}
+
+// SetDiffMarks draws change bars in the left text margin. An empty slice
+// removes them. It reports false when the view cannot draw them.
+func (v *View) SetDiffMarks(marks []DiffMark) bool {
+	var pointer *C.int
+	if len(marks) > 0 {
+		native := make([]C.int, 0, 3*len(marks))
+		for _, mark := range marks {
+			native = append(native, C.int(mark.Line), C.int(mark.Count), C.int(mark.Kind))
+		}
+		pointer = &native[0]
+		defer runtime.KeepAlive(native)
+	}
+	ok := C.bridge_set_diff(v.native(), pointer, C.int(len(marks))) != 0
 	runtime.KeepAlive(v)
 	return ok
 }

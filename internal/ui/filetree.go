@@ -36,6 +36,7 @@ type projectTree struct {
 	dirMenu  *gio.Menu
 	fileMenu *gio.Menu
 	popover  *gtk.PopoverMenu
+	hidden   *gtk.Switch
 	target   string
 }
 
@@ -74,6 +75,8 @@ func (w *window) setProjectRoot(path string) {
 	w.sidebar.SetVisible(true)
 	w.content.SetPosition(max(w.sidebarWidth, 160))
 	w.title.SetSubtitle(root)
+	w.rememberPath(root, true)
+	w.updateEmptyState()
 }
 
 func newProjectTree(w *window, root string) *projectTree {
@@ -124,6 +127,7 @@ func newProjectTree(w *window, root string) *projectTree {
 	scroller.SetVExpand(true)
 	scroller.SetChild(t.list)
 	w.sidebarBody.Append(scroller)
+	w.sidebarBody.Append(t.footer())
 
 	t.load(root)
 	return t
@@ -150,6 +154,34 @@ func (t *projectTree) header() *gtk.Box {
 	add("document-new-symbolic", "New File", func() { t.w.createProjectEntry(t.root, false) })
 	add("folder-new-symbolic", "New Folder", func() { t.w.createProjectEntry(t.root, true) })
 	add("view-refresh-symbolic", "Refresh Explorer", t.refresh)
+	return row
+}
+
+// footer holds the hidden-files switch. Toggling it rereads the expanded
+// folders in place and saves the choice to the config file.
+func (t *projectTree) footer() *gtk.Box {
+	row := gtk.NewBox(gtk.OrientationHorizontal, 8)
+	row.AddCSSClass("project-tree-footer")
+	label := gtk.NewLabel("Show hidden files")
+	label.SetXAlign(0)
+	label.SetHExpand(true)
+	label.AddCSSClass("dim-label")
+	toggle := gtk.NewSwitch()
+	t.hidden = toggle
+	toggle.SetVAlign(gtk.AlignCenter)
+	toggle.SetActive(t.w.options.Config.Editor.ShowHiddenFiles)
+	toggle.SetTooltipText("List files and folders whose names start with a dot")
+	toggle.NotifyProperty("active", func() {
+		if toggle.Active() == t.w.options.Config.Editor.ShowHiddenFiles {
+			return
+		}
+		cfg := t.w.options.Config
+		cfg.Editor.ShowHiddenFiles = toggle.Active()
+		t.w.applyConfig(cfg)
+		t.refresh()
+	})
+	row.Append(label)
+	row.Append(toggle)
 	return row
 }
 
@@ -198,8 +230,9 @@ func (t *projectTree) createModel(item *coreglib.Object) *gio.ListModel {
 func (t *projectTree) load(directory string) {
 	t.loads[directory]++
 	sequence := t.loads[directory]
+	showHidden := t.w.options.Config.Editor.ShowHiddenFiles
 	go func() {
-		entries, err := readProjectDir(directory)
+		entries, err := readProjectDir(directory, showHidden)
 		dispatch.Main(func() {
 			if t.closed || t.loads[directory] != sequence {
 				return
@@ -580,6 +613,7 @@ func (w *window) deleteProjectEntry(path string) {
 						doc.props = editorconfig.Properties{}
 						doc.buffer.SetModified(true)
 						doc.updatePresentation()
+						doc.refreshDiffBase()
 					}
 				}
 				w.reloadProjectDir(filepath.Dir(path))

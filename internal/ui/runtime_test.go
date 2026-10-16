@@ -418,7 +418,7 @@ func TestEditorRuntimeSmoke(t *testing.T) {
 func assertWindowActions(t *testing.T, w *window) {
 	t.Helper()
 	for _, name := range []string{
-		"new", "open", "command-palette", "quick-open", "save", "save-as", "find", "replace",
+		"new", "open", "open-folder", "open-path", "show-changes", "command-palette", "quick-open", "save", "save-as", "find", "replace",
 		"markdown-preview", "ai-transform", "undo", "redo", "toggle-sidebar", "show-sidebar", "close-tab",
 		"complete", "lsp-complete", "select-next", "select-all-occurrences", "next-tab", "previous-tab",
 		"find-next", "find-previous", "preferences", "shortcuts", "about",
@@ -429,7 +429,7 @@ func assertWindowActions(t *testing.T, w *window) {
 	}
 	for action, shortcut := range map[string]string{
 		"new": "<Control>n", "command-palette": "<Control><Shift>p", "quick-open": "<Control>p",
-		"open": "<Control>o", "save": "<Control>s", "save-as": "<Control><Shift>s",
+		"open": "<Control>o", "open-path": "<Control><Alt>o", "show-changes": "<Control><Alt>d", "save": "<Control>s", "save-as": "<Control><Shift>s",
 		"find": "<Control>f", "replace": "<Control>h", "markdown-preview": "<Control><Shift>v",
 		"toggle-sidebar": "<Control>b",
 		"show-sidebar":   "<Control><Shift>e", "close-tab": "<Control>w", "complete": "<Alt>backslash",
@@ -670,10 +670,10 @@ func checkMultiCursorEditing(t *testing.T, doc *editorDocument) {
 	}
 }
 
-func waitFrames(t *testing.T, widget *gtk.TextView, count int) {
+func waitFrames(t *testing.T, widget gtk.Widgetter, count int) {
 	t.Helper()
 	frames := 0
-	widget.AddTickCallback(func(gtk.Widgetter, gdk.FrameClocker) bool {
+	gtk.BaseWidget(widget).AddTickCallback(func(gtk.Widgetter, gdk.FrameClocker) bool {
 		frames++
 		return frames < count
 	})

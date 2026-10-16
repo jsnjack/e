@@ -20,7 +20,13 @@ type paletteItem struct {
 	title    string
 	detail   string
 	shortcut string
+	icon     string
+	// complete is the entry text that Tab puts in the path picker.
+	complete string
 	run      func()
+	// stay keeps the palette open after run, for steps such as entering a
+	// folder in the path picker.
+	stay bool
 	// key is the lowercased "title detail" text, built once per item so
 	// filtering does not allocate per keystroke.
 	key []rune
@@ -45,6 +51,7 @@ func (w *window) commandPaletteItems() []paletteItem {
 	return []paletteItem{
 		{id: "new", title: "File: New Text File", shortcut: "Ctrl+N", run: func() { w.newDocument(nil) }},
 		{id: "open", title: "File: Open File…", shortcut: "Ctrl+O", run: w.chooseOpen},
+		{id: "open-folder", title: "File: Open Folder…", shortcut: "Ctrl+K Ctrl+O", run: w.chooseFolder},
 		{id: "save", title: "File: Save", shortcut: "Ctrl+S", run: w.saveActive},
 		{id: "save-as", title: "File: Save As…", shortcut: "Ctrl+Shift+S", run: w.saveActiveAs},
 		{id: "close", title: "File: Close Tab", shortcut: "Ctrl+W", run: func() {
@@ -53,12 +60,14 @@ func (w *window) commandPaletteItems() []paletteItem {
 			}
 		}},
 		{id: "quick-open", title: "Go: Quick Open", shortcut: "Ctrl+P", run: w.showQuickOpen},
+		{id: "open-path", title: "Go: Open Path…", shortcut: "Ctrl+Alt+O", run: w.showPathPicker},
 		{id: "sidebar", title: "View: Toggle Primary Side Bar", shortcut: "Ctrl+B", run: w.toggleSidebar},
 		{id: "markdown-preview", title: "View: Open Markdown Preview", shortcut: "Ctrl+Shift+V", run: func() {
 			if doc := w.active(); doc != nil {
 				doc.toggleMarkdownPreview()
 			}
 		}},
+		{id: "show-changes", title: "Git: Show Changes in gdiff", shortcut: "Ctrl+Alt+D", run: w.showChangesInGdiff},
 		{id: "find", title: "Edit: Find", shortcut: "Ctrl+F", run: func() { w.showSearch(false) }},
 		{id: "replace", title: "Edit: Replace", shortcut: "Ctrl+H", run: func() { w.showSearch(true) }},
 		{id: "undo", title: "Edit: Undo", shortcut: "Ctrl+Z", run: func() {
@@ -134,35 +143,64 @@ func (w *window) showQuickOpen() {
 }
 
 func (w *window) showPalette(title, placeholder string, load func(func([]paletteItem))) {
-	dialog := adw.NewDialog()
-	closed := false
-	dialog.ConnectClosed(func() { closed = true })
-	dialog.SetTitle(title)
-	dialog.SetContentWidth(680)
-	dialog.SetContentHeight(520)
+	p := w.newPalette(title, placeholder)
+	var items []paletteItem
+	p.entry.ConnectSearchChanged(func() {
+		p.show(filterPaletteItems(items, p.entry.Text(), maxPaletteResults))
+	})
+	load(func(loaded []paletteItem) {
+		if p.closed {
+			return
+		}
+		items = withSearchKeys(loaded)
+		p.show(filterPaletteItems(items, p.entry.Text(), maxPaletteResults))
+	})
+	p.present()
+}
+
+// palette is the dialog behind every list picker: a search entry over a
+// list of rows. Callers decide which items show for the entry text.
+type palette struct {
+	w       *window
+	dialog  *adw.Dialog
+	entry   *gtk.SearchEntry
+	list    *gtk.ListBox
+	visible []paletteItem
+	closed  bool
+	// key, when set, sees each key press before the list does.
+	key func(keyval uint, state gdk.ModifierType) bool
+}
+
+func (w *window) newPalette(title, placeholder string) *palette {
+	p := &palette{w: w, dialog: adw.NewDialog()}
+	p.dialog.ConnectClosed(func() { p.closed = true })
+	p.dialog.SetTitle(title)
+	p.dialog.SetContentWidth(680)
+	p.dialog.SetContentHeight(520)
 	box := gtk.NewBox(gtk.OrientationVertical, 8)
 	box.SetMarginTop(12)
 	box.SetMarginBottom(12)
 	box.SetMarginStart(12)
 	box.SetMarginEnd(12)
-	entry := gtk.NewSearchEntry()
-	entry.SetPlaceholderText(placeholder)
-	list := gtk.NewListBox()
-	list.SetSelectionMode(gtk.SelectionSingle)
-	list.AddCSSClass("boxed-list")
+	p.entry = gtk.NewSearchEntry()
+	p.entry.SetPlaceholderText(placeholder)
+	p.list = gtk.NewListBox()
+	p.list.SetSelectionMode(gtk.SelectionSingle)
+	p.list.AddCSSClass("boxed-list")
 	scroll := gtk.NewScrolledWindow()
 	scroll.SetPolicy(gtk.PolicyNever, gtk.PolicyAutomatic)
 	scroll.SetVExpand(true)
-	scroll.SetChild(list)
-	box.Append(entry)
+	scroll.SetChild(p.list)
+	box.Append(p.entry)
 	box.Append(scroll)
-	var items []paletteItem
-	var visibleItems []paletteItem
 	keys := gtk.NewEventControllerKey()
 	keys.SetPropagationPhase(gtk.PhaseCapture)
-	keys.ConnectKeyPressed(func(keyval, _ uint, _ gdk.ModifierType) bool {
+	keys.ConnectKeyPressed(func(keyval, _ uint, state gdk.ModifierType) bool {
 		if paletteDismissKey(keyval) {
-			dialog.Close()
+			p.dialog.Close()
+			return true
+		}
+		if p.key != nil && p.key(keyval, state) {
 			return true
 		}
 		direction := 0
@@ -175,50 +213,61 @@ func (w *window) showPalette(title, placeholder string, load func(func([]palette
 			return false
 		}
 		current := 0
-		if row := list.SelectedRow(); row != nil {
+		if row := p.list.SelectedRow(); row != nil {
 			current = row.Index()
 		}
-		if row := list.RowAtIndex(nextPaletteIndex(current, len(visibleItems), direction)); row != nil {
-			list.SelectRow(row)
+		if row := p.list.RowAtIndex(nextPaletteIndex(current, len(p.visible), direction)); row != nil {
+			p.list.SelectRow(row)
 		}
 		return true
 	})
 	box.AddController(keys)
-	dialog.SetChild(box)
+	p.dialog.SetChild(box)
+	p.entry.ConnectActivate(func() {
+		if row := p.list.SelectedRow(); row != nil {
+			p.activate(row.Index())
+		}
+	})
+	p.list.ConnectRowActivated(func(row *gtk.ListBoxRow) { p.activate(row.Index()) })
+	return p
+}
 
-	refresh := func() {
-		list.RemoveAll()
-		visibleItems = filterPaletteItems(items, entry.Text(), maxPaletteResults)
-		for _, item := range visibleItems {
-			row := paletteRow(item)
-			list.Append(row)
-		}
-		if row := list.RowAtIndex(0); row != nil {
-			list.SelectRow(row)
-		}
+// show replaces the rows and selects the first one.
+func (p *palette) show(items []paletteItem) {
+	p.list.RemoveAll()
+	p.visible = items
+	for _, item := range items {
+		p.list.Append(paletteRow(item))
 	}
-	activate := func(row *gtk.ListBoxRow) {
-		if item, ok := paletteItemAt(visibleItems, row.Index()); ok {
-			dialog.Close()
-			item.run()
-		}
+	if row := p.list.RowAtIndex(0); row != nil {
+		p.list.SelectRow(row)
 	}
-	entry.ConnectSearchChanged(refresh)
-	entry.ConnectActivate(func() {
-		if row := list.SelectedRow(); row != nil {
-			activate(row)
-		}
-	})
-	list.ConnectRowActivated(activate)
-	load(func(loaded []paletteItem) {
-		if closed {
-			return
-		}
-		items = withSearchKeys(loaded)
-		refresh()
-	})
-	dialog.Present(w.win)
-	entry.GrabFocus()
+}
+
+// selected returns the highlighted item.
+func (p *palette) selected() (paletteItem, bool) {
+	row := p.list.SelectedRow()
+	if row == nil {
+		return paletteItem{}, false
+	}
+	return paletteItemAt(p.visible, row.Index())
+}
+
+func (p *palette) activate(index int) {
+	item, ok := paletteItemAt(p.visible, index)
+	if !ok {
+		return
+	}
+	if !item.stay {
+		p.dialog.Close()
+	}
+	item.run()
+}
+
+func (p *palette) present() {
+	p.w.lastPalette = p
+	p.dialog.Present(p.w.win)
+	p.entry.GrabFocus()
 }
 
 func paletteDismissKey(keyval uint) bool { return keyval == gdk.KEY_Escape }
@@ -275,6 +324,11 @@ func paletteRow(item paletteItem) *gtk.ListBoxRow {
 	content.SetMarginBottom(8)
 	content.SetMarginStart(10)
 	content.SetMarginEnd(10)
+	if item.icon != "" {
+		icon := gtk.NewImageFromIconName(item.icon)
+		icon.AddCSSClass("dim-label")
+		content.Append(icon)
+	}
 	labels := gtk.NewBox(gtk.OrientationVertical, 2)
 	title := gtk.NewLabel(item.title)
 	title.SetXAlign(0)

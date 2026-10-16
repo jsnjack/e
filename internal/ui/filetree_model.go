@@ -24,8 +24,9 @@ type projectSplice struct {
 }
 
 // readProjectDir lists directory for the sidebar. Version-control metadata is
-// skipped; folders come first, then names in case-insensitive order.
-func readProjectDir(directory string) ([]projectEntry, error) {
+// always skipped, and other dot entries unless showHidden is set. Folders
+// come first, then names in case-insensitive order.
+func readProjectDir(directory string, showHidden bool) ([]projectEntry, error) {
 	entries, err := os.ReadDir(directory)
 	if err != nil {
 		return nil, fmt.Errorf("read project directory: %w", err)
@@ -34,6 +35,9 @@ func readProjectDir(directory string) ([]projectEntry, error) {
 	for _, entry := range entries {
 		switch entry.Name() {
 		case ".git", ".hg", ".svn":
+			continue
+		}
+		if !showHidden && strings.HasPrefix(entry.Name(), ".") {
 			continue
 		}
 		result = append(result, projectEntry{path: filepath.Join(directory, entry.Name()), dir: entry.IsDir()})
