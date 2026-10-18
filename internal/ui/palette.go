@@ -63,6 +63,7 @@ func (w *window) commandPaletteItems() []paletteItem {
 		}},
 		{id: "quick-open", title: "Go: Go to File or Folder", shortcut: "Ctrl+P", run: w.showQuickOpen},
 		{id: "sidebar", title: "View: Toggle Primary Side Bar", shortcut: "Ctrl+B", run: w.toggleSidebar},
+		{id: "explorer", title: "View: Show Explorer", shortcut: "Ctrl+Shift+E", run: func() { w.showSidebarView("files") }},
 		{id: "markdown-preview", title: "View: Open Markdown Preview", shortcut: "Ctrl+Shift+V", run: func() {
 			if doc := w.active(); doc != nil {
 				doc.toggleMarkdownPreview()
@@ -71,6 +72,9 @@ func (w *window) commandPaletteItems() []paletteItem {
 		{id: "show-changes", title: "Git: Show Changes in gdiff", shortcut: "Ctrl+Alt+D", run: w.showChangesInGdiff},
 		{id: "find", title: "Edit: Find", shortcut: "Ctrl+F", run: func() { w.showSearch(false) }},
 		{id: "replace", title: "Edit: Replace", shortcut: "Ctrl+H", run: func() { w.showSearch(true) }},
+		{id: "find-in-folder", title: "Search: Find in Folder", shortcut: "Ctrl+Shift+F", run: w.showFolderSearch},
+		{id: "next-search-result", title: "Search: Go to Next Result", shortcut: "F4", run: func() { w.folderSearch.navigate(1) }},
+		{id: "previous-search-result", title: "Search: Go to Previous Result", shortcut: "Shift+F4", run: func() { w.folderSearch.navigate(-1) }},
 		{id: "undo", title: "Edit: Undo", shortcut: "Ctrl+Z", run: func() {
 			if doc := w.active(); doc != nil && doc.buffer.CanUndo() {
 				doc.buffer.Undo()

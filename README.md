@@ -74,6 +74,8 @@ Common shortcuts:
 |---|---|
 | `Ctrl+O` / `Ctrl+S` | Open / save |
 | `Ctrl+F` / `Ctrl+H` | Find / replace |
+| `Ctrl+Shift+F` | Search the project folder |
+| `F4` / `Shift+F4` | Open the next / previous folder search result |
 | `Tab` | Accept an inline suggestion |
 | `Ctrl+Right` | Accept the next part of a suggestion |
 | `Alt+\` | Request an AI suggestion |
@@ -86,7 +88,7 @@ Common shortcuts:
 | `Ctrl+U` | Remove the last added cursor |
 | `Escape` | Return to one cursor |
 | `Ctrl+B` | Show or hide the project sidebar |
-| `Ctrl+Shift+E` | Show the project sidebar |
+| `Ctrl+Shift+E` | Show the project files |
 | `Ctrl+Shift+P` / `Ctrl+P` | Command Palette / Quick Open |
 | `Ctrl+Shift+V` | Toggle Markdown preview |
 | `Ctrl+Tab` / `Ctrl+Shift+Tab` | Select the next / previous tab |

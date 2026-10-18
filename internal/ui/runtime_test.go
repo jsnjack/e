@@ -151,6 +151,11 @@ func TestEditorRuntimeSmoke(t *testing.T) {
 	if !w.replaceEntry.Visible() {
 		t.Fatal("Replace did not reveal the replacement field")
 	}
+	// Selecting a new tab with search open refreshes its search state.
+	if w.newDocument(nil).search == nil {
+		t.Fatal("a tab opened during search has no search state")
+	}
+	w.tabs.ClosePage(w.tabs.SelectedPage())
 	w.searchBar.SetSearchMode(false)
 	if w.tabs.NPages() != 1 || w.active() != doc {
 		t.Fatalf("closing the new tab did not restore the original tab")
@@ -422,6 +427,7 @@ func assertWindowActions(t *testing.T, w *window) {
 		"markdown-preview", "ai-transform", "undo", "redo", "toggle-sidebar", "show-sidebar", "close-tab",
 		"complete", "lsp-complete", "select-next", "select-all-occurrences", "next-tab", "previous-tab",
 		"find-next", "find-previous", "preferences", "shortcuts", "about",
+		"find-in-folder", "next-search-result", "previous-search-result",
 	} {
 		if action := w.win.LookupAction(name); action == nil {
 			t.Errorf("window action %q is missing", name)
@@ -436,7 +442,8 @@ func assertWindowActions(t *testing.T, w *window) {
 		"lsp-complete": "<Control>space", "select-next": "<Control>d",
 		"select-all-occurrences": "<Control><Shift>l", "next-tab": "<Control>Tab",
 		"previous-tab": "<Control><Shift>Tab", "find-next": "F3", "find-previous": "<Shift>F3",
-		"preferences": "<Control>comma",
+		"preferences": "<Control>comma", "find-in-folder": "<Control><Shift>f",
+		"next-search-result": "F4", "previous-search-result": "<Shift>F4",
 	} {
 		if got := w.app.AccelsForAction("win." + action); !containsAccelerator(got, shortcut) {
 			t.Errorf("action %q accelerators = %v, want %q", action, got, shortcut)

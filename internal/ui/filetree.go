@@ -70,6 +70,7 @@ func (w *window) setProjectRoot(path string) {
 		w.projectRoot = root
 		logging.Trace("ui: open project", "root", root)
 		w.projectTree = newProjectTree(w, root)
+		w.folderSearch.rootChanged()
 	}
 	w.sidebarToggle.SetVisible(true)
 	w.sidebar.SetVisible(true)

@@ -60,6 +60,8 @@ type editorDocument struct {
 	modTime int64
 	props   editorconfig.Properties
 	loading bool
+	// afterLoad runs once when the text being loaded is in the buffer.
+	afterLoad func()
 	// pending is the session state of a document that is still loading, so
 	// a session save during loading keeps its recovery copy.
 	pending     *document.Snapshot
@@ -158,10 +160,12 @@ func (w *window) newDocument(snapshot *document.Snapshot) *editorDocument {
 	doc.split.SetShrinkStartChild(false)
 	doc.split.SetShrinkEndChild(false)
 	doc.split.SetWideHandle(true)
+	// Selecting the page refreshes its search when the search bar is open,
+	// so the search state must exist first.
+	doc.search = newSearchState(doc)
 	doc.page = w.tabs.Append(doc.split)
 	w.documents[doc.page] = doc
 	w.tabs.SetSelectedPage(doc.page)
-	doc.search = newSearchState(doc)
 	doc.connectSignals()
 
 	if snapshot != nil {
@@ -385,6 +389,7 @@ func (d *editorDocument) load(path string, cursor int) {
 			if err != nil {
 				d.loading = false
 				d.pending = nil
+				d.afterLoad = nil
 				d.view.Widget.SetEditable(true)
 				d.page.SetLoading(false)
 				if errors.Is(err, fs.ErrNotExist) {
@@ -470,6 +475,10 @@ func (d *editorDocument) insertChunks(data []byte, modified bool, cursor int, pr
 		d.scheduleMarkdownPreview()
 		if done != nil {
 			done(true)
+		}
+		if after := d.afterLoad; after != nil {
+			d.afterLoad = nil
+			after()
 		}
 		return false
 	})

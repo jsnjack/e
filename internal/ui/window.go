@@ -46,6 +46,8 @@ type window struct {
 	empty               *emptyState
 	sidebar             *gtk.ScrolledWindow
 	sidebarBody         *gtk.Box
+	sidebarStack        *gtk.Stack
+	folderSearch        *folderSearch
 	sidebarToggle       *gtk.Button
 	sidebarWidth        int
 	projectRoot         string
@@ -185,6 +187,7 @@ func (w *window) build() {
 	menu.Append("Open Folder…", "win.open-folder")
 	menu.Append("Save As…", "win.save-as")
 	menu.Append("Find and Replace", "win.replace")
+	menu.Append("Find in Folder", "win.find-in-folder")
 	menu.Append("Markdown Preview", "win.markdown-preview")
 	menu.Append("Show Changes in gdiff", "win.show-changes")
 	menu.Append("Transform Selection with AI…", "win.ai-transform")
@@ -281,10 +284,27 @@ func (w *window) build() {
 	toolbar.AddTopBar(w.tabBar)
 	toolbar.AddTopBar(w.searchBar)
 	w.sidebarBody = gtk.NewBox(gtk.OrientationVertical, 0)
+	w.folderSearch = newFolderSearch(w)
+	// The sidebar holds two views, like VS Code's Explorer and Search.
+	w.sidebarStack = gtk.NewStack()
+	w.sidebarStack.AddTitled(w.sidebarBody, "files", "Explorer (Ctrl+Shift+E)").SetIconName("folder-symbolic")
+	w.sidebarStack.AddTitled(w.folderSearch.root, "search", "Search (Ctrl+Shift+F)").SetIconName("system-search-symbolic")
+	w.sidebarStack.NotifyProperty("visible-child-name", func() {
+		if w.sidebarStack.VisibleChildName() == "search" {
+			w.folderSearch.search(false)
+			w.folderSearch.entry.GrabFocus()
+		}
+	})
+	switcher := gtk.NewStackSwitcher()
+	switcher.SetStack(w.sidebarStack)
+	switcher.AddCSSClass("sidebar-switcher")
+	sidebarBox := gtk.NewBox(gtk.OrientationVertical, 0)
+	sidebarBox.Append(switcher)
+	sidebarBox.Append(w.sidebarStack)
 	w.sidebar = gtk.NewScrolledWindow()
 	w.sidebar.SetPolicy(gtk.PolicyNever, gtk.PolicyAutomatic)
 	w.sidebar.SetMinContentWidth(160)
-	w.sidebar.SetChild(w.sidebarBody)
+	w.sidebar.SetChild(sidebarBox)
 	w.sidebar.SetVisible(false)
 	w.sidebarWidth = 260
 	w.content = gtk.NewPaned(gtk.OrientationHorizontal)
@@ -360,9 +380,14 @@ func (w *window) registerActions() {
 	})
 	w.action("toggle-sidebar", w.toggleSidebar, "<Control>b")
 	w.action("show-sidebar", func() {
-		w.showSidebar()
-		w.sidebar.GrabFocus()
+		w.showSidebarView("files")
+		if w.projectTree != nil && w.sidebar.Visible() {
+			w.projectTree.list.GrabFocus()
+		}
 	}, "<Control><Shift>e")
+	w.action("find-in-folder", w.showFolderSearch, "<Control><Shift>f")
+	w.action("next-search-result", func() { w.folderSearch.navigate(1) }, "F4")
+	w.action("previous-search-result", func() { w.folderSearch.navigate(-1) }, "<Shift>F4")
 	w.action("close-tab", func() {
 		if page := w.tabs.SelectedPage(); page != nil {
 			w.tabs.ClosePage(page)
@@ -497,6 +522,12 @@ func (w *window) toggleSidebar() {
 		w.sidebar.SetVisible(false)
 		return
 	}
+	w.showSidebar()
+}
+
+// showSidebarView shows the sidebar with its "files" or "search" view.
+func (w *window) showSidebarView(name string) {
+	w.sidebarStack.SetVisibleChildName(name)
 	w.showSidebar()
 }
 
@@ -682,6 +713,30 @@ func (w *window) openPath(path string) {
 	doc.load(path, 0)
 }
 
+// textPosition is a line and a character column, both counted from zero.
+type textPosition struct{ line, column int }
+
+// openPathAt opens a file and selects from..to once its text has loaded.
+func (w *window) openPathAt(path string, from, to textPosition) {
+	doc, page := w.documentForPath(path)
+	if doc == nil {
+		w.rememberPath(path, false)
+		doc = w.newDocument(nil)
+		doc.load(path, 0)
+	} else {
+		w.tabs.SetSelectedPage(page)
+	}
+	reveal := func() {
+		doc.selectSpan(from, to)
+		doc.view.Widget.GrabFocus()
+	}
+	if doc.loading {
+		doc.afterLoad = reveal
+		return
+	}
+	reveal()
+}
+
 func (w *window) chooseOpen() {
 	dialog := gtk.NewFileDialog()
 	dialog.SetTitle("Open File")
@@ -827,10 +882,18 @@ func (w *window) closePage(page *adw.TabPage) bool {
 	return true
 }
 
+// showSearch opens Find. As in VS Code, the query starts as the selection
+// on one line, or else the word at the caret.
 func (w *window) showSearch(replace bool) {
 	w.replaceEntry.SetVisible(replace)
+	if doc := w.active(); doc != nil {
+		if seed := doc.searchSeed(true); seed != "" {
+			w.searchEntry.SetText(seed)
+		}
+	}
 	w.searchBar.SetSearchMode(true)
 	w.searchEntry.GrabFocus()
+	w.searchEntry.SelectRegion(0, -1)
 }
 
 func (w *window) navigateMatch(direction int) {
@@ -941,6 +1004,21 @@ func loadCSS() {
 .editor { font-family: monospace; font-size: 11pt; }
 .inline-completion { font-family: monospace; font-size: 11pt; }
 .search-count { min-width: 5em; }
+.sidebar-switcher { margin: 6px 8px 2px; }
+.sidebar-switcher > button { padding: 2px 0; background: none; box-shadow: none; }
+.sidebar-switcher > button:hover { background: alpha(@window_fg_color, .07); }
+.sidebar-switcher > button:checked { background: alpha(@accent_bg_color, .16); color: @accent_color; }
+.folder-search { padding: 6px 4px 4px 8px; }
+.folder-search-option { min-width: 26px; padding: 0 4px; font-family: monospace; font-size: .85em; }
+.folder-search-count {
+  min-width: 12px;
+  padding: 0 6px;
+  border-radius: 9px;
+  font-size: .8em;
+  font-weight: 600;
+  background: alpha(@window_fg_color, .1);
+}
+.folder-search-line { margin-left: 28px; }
 .project-tree { padding: 4px; }
 .project-entry-row { border-radius: 6px; }
 .project-entry-open { padding: 5px 7px; border-radius: 6px; }

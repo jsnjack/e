@@ -29,6 +29,10 @@ editing, EditorConfig support, and availability-aware AI autocomplete.
   against the project, or home without one. Other text fuzzy-matches project
   files, then recent paths (`internal/recent`) and home, then walks folders
   from home: `dow bana` finds `~/Downloads/banana.txt`.
+- Find in Folder (Ctrl+Shift+F) is the sidebar's Search view, beside the
+  file tree, as in VS Code. It searches off the GTK thread and stops at 1000
+  matches. Results are grouped by file; F4 and Shift+F4 step through them.
+  Ctrl+F and Ctrl+Shift+F start from a one-line selection.
 - The project sidebar is a `GtkListView` over a `GtkTreeListModel`. Folders
   are read off the GTK thread when expanded, and file operations reload only
   the affected folder, so expanded folders stay open. Dot files are hidden
@@ -55,6 +59,7 @@ editing, EditorConfig support, and availability-aware AI autocomplete.
   and replaces the page body in place after the first load.
 - `internal/workspace` lists project files for Quick Open, through
   `git ls-files` inside a Git repository, and single folders for the picker.
+  It also searches the text of those files for Find in Folder.
 - `internal/recent` stores opened files and folders, ranked by how often and
   how lately each was opened.
 - `internal/linediff` compares line hashes with a bounded Myers diff.
@@ -66,10 +71,10 @@ editing, EditorConfig support, and availability-aware AI autocomplete.
 - `packaging/e.spec` packages the prebuilt binary as an RPM. `make release`
   builds the RPM and tarball into `dist/` and publishes them with grm.
 - `make test-ui` exercises GTK actions, shortcuts, tabs, editing, disk I/O, the
-  file tree, the path picker, change bars, and Markdown preview.
+  file tree, the path picker, change bars, folder search, and Markdown preview.
   `scripts/headless.sh` runs it in a private headless Weston session;
   `E_TEST_VISIBLE=1` uses the desktop instead. `E_TEST_SCREENSHOTS=<dir>`
-  saves PNGs of the empty state, path picker, and change bars.
+  saves PNGs of the empty state, path picker, change bars, and folder search.
 
 The editor must remain interactive with a 5 MB highlighted document. Never run
 network or process I/O on the GTK thread, never copy the whole document on each

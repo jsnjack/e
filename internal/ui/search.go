@@ -294,3 +294,24 @@ func (s *searchState) matchIsCurrent(match textRange) bool {
 	}
 	return text == s.query
 }
+
+// searchSeed returns the text a search starts with, as in VS Code: the
+// selection when it is on one line, else, with nearestWord, the word at the
+// caret.
+func (d *editorDocument) searchSeed(nearestWord bool) string {
+	start, end, selected := d.buffer.SelectionBounds()
+	if selected && start.Line() != end.Line() || !selected && !nearestWord {
+		return ""
+	}
+	word, _, _, _ := d.selectedWord()
+	return word
+}
+
+// selectSpan selects from..to with the caret at the end, and scrolls it
+// into view.
+func (d *editorDocument) selectSpan(from, to textPosition) {
+	start, _ := d.buffer.IterAtLineOffset(from.line, from.column)
+	end, _ := d.buffer.IterAtLineOffset(to.line, to.column)
+	d.buffer.SelectRange(end, start)
+	d.view.Widget.ScrollToMark(d.buffer.GetInsert(), .15, false, 0, 0)
+}
