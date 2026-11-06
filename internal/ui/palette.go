@@ -61,6 +61,7 @@ func (w *window) commandPaletteItems() []paletteItem {
 				w.tabs.ClosePage(page)
 			}
 		}},
+		{id: "close-saved", title: "File: Close Saved Tabs", run: w.closeSavedTabs},
 		{id: "quick-open", title: "Go: Go to File or Folder", shortcut: "Ctrl+P", run: w.showQuickOpen},
 		{id: "sidebar", title: "View: Toggle Primary Side Bar", shortcut: "Ctrl+B", run: w.toggleSidebar},
 		{id: "explorer", title: "View: Show Explorer", shortcut: "Ctrl+Shift+E", run: func() { w.showSidebarView("files") }},

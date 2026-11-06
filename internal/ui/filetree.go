@@ -54,11 +54,15 @@ type projectRow struct {
 
 // setProjectRoot enables the project sidebar for a directory. Only the root
 // level is read; subdirectories are read on expansion. Opening the current
-// root again refreshes the tree in place.
+// root again refreshes the tree in place. The window's tabs become the ones
+// saved for the directory, as switchSession describes.
 func (w *window) setProjectRoot(path string) {
 	root, err := filepath.Abs(path)
 	if err != nil {
 		w.toast("Couldn’t open project folder")
+		return
+	}
+	if !w.switchSession(root) {
 		return
 	}
 	if tree := w.projectTree; tree != nil && tree.root == root && w.projectRoot == root {

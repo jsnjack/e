@@ -87,3 +87,74 @@ func TestSaveSessionRemovesStaleRecovery(t *testing.T) {
 		t.Fatalf("got %+v", got)
 	}
 }
+
+func TestSessionDir(t *testing.T) {
+	state := "/state"
+	cases := []struct {
+		name, first, second string
+		same                bool
+	}{
+		{name: "same folder", first: "/home/a/project", second: "/home/a/project", same: true},
+		{name: "same name in other folders", first: "/home/a/project", second: "/home/b/project"},
+		{name: "folder and no folder", first: "/home/a/project", second: ""},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			first, second := SessionDir(state, tc.first), SessionDir(state, tc.second)
+			if (first == second) != tc.same {
+				t.Fatalf("SessionDir(%q) = %s, SessionDir(%q) = %s", tc.first, first, tc.second, second)
+			}
+			if filepath.Dir(first) != filepath.Join(state, sessionsDirname) {
+				t.Fatalf("SessionDir(%q) = %s is outside the sessions directory", tc.first, first)
+			}
+		})
+	}
+	if got := filepath.Base(SessionDir(state, "/home/a/my project")); got[:len("my_project-")] != "my_project-" {
+		t.Fatalf("session directory name = %q", got)
+	}
+}
+
+func TestLastSessionRoundTrip(t *testing.T) {
+	dir := t.TempDir()
+	if got, err := LoadLastSession(dir); err != nil || got != (LastSession{}) {
+		t.Fatalf("LoadLastSession before any save = %+v, %v", got, err)
+	}
+	want := LastSession{Folder: "/home/a/project", Project: true}
+	if err := SaveLastSession(dir, want); err != nil {
+		t.Fatal(err)
+	}
+	if got, err := LoadLastSession(dir); err != nil || got != want {
+		t.Fatalf("LoadLastSession = %+v, %v", got, err)
+	}
+}
+
+func TestMigrateSharedSession(t *testing.T) {
+	dir := t.TempDir()
+	shared := []Snapshot{
+		{ID: "draft", Title: "Untitled", Text: []byte("note"), Modified: true, Active: true},
+		{ID: "empty", Title: "Untitled"},
+		{ID: "edited", Path: "/tmp/edited.txt", Title: "edited.txt", Text: []byte("new"), Modified: true},
+		{ID: "clean", Path: "/tmp/clean.txt", Title: "clean.txt"},
+	}
+	if err := SaveSession(dir, shared); err != nil {
+		t.Fatal(err)
+	}
+	for run := 1; run <= 2; run++ {
+		if err := MigrateSharedSession(dir); err != nil {
+			t.Fatalf("run %d: %v", run, err)
+		}
+	}
+	for _, name := range []string{sessionFilename, recoveryDirname} {
+		if _, err := os.Stat(filepath.Join(dir, name)); !os.IsNotExist(err) {
+			t.Errorf("shared %s still present: %v", name, err)
+		}
+	}
+	got, err := LoadSession(SessionDir(dir, ""))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 2 || got[0].ID != "draft" || string(got[0].Text) != "note" || got[0].Active ||
+		got[1].ID != "edited" || string(got[1].Text) != "new" {
+		t.Fatalf("migrated tabs = %+v", got)
+	}
+}

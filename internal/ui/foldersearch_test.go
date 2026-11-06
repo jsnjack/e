@@ -151,8 +151,10 @@ func TestFolderSearchRuntime(t *testing.T) {
 		t.Fatalf("new folder result is in %s", s.groups[0].path)
 	}
 
-	// Ctrl+F starts with the word at the caret.
+	// Ctrl+F starts with the word at the caret. Opening the other folder
+	// closed a.txt, so it loads again.
 	w.openPath(a)
+	waitForUI(t, func() bool { doc := w.active(); return doc != nil && doc.path == a && !doc.loading })
 	doc = w.active()
 	doc.buffer.PlaceCursor(doc.buffer.IterAtOffset(2))
 	w.showSearch(false)

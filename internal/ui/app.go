@@ -52,7 +52,8 @@ func Run(options Options, paths []string) error {
 	app.ConnectOpen(func(files []gio.Filer, _ string) {
 		logging.Trace("ui: open files", "count", len(files))
 		win := ensureWindow()
-		win.restoreSession()
+		// The first folder, or the folder of the first file, chooses which
+		// saved tabs open, so the last session is not restored here.
 		for _, file := range files {
 			win.openPath(file.Path())
 		}

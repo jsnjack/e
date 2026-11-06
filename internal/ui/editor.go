@@ -18,6 +18,7 @@ import (
 	"github.com/diamondburned/gotk4-adwaita/pkg/adw"
 	"github.com/diamondburned/gotk4/pkg/core/glib"
 	"github.com/diamondburned/gotk4/pkg/gdk/v4"
+	"github.com/diamondburned/gotk4/pkg/gio/v2"
 	"github.com/diamondburned/gotk4/pkg/gtk/v4"
 	"github.com/jsnjack/e/internal/activity"
 	"github.com/jsnjack/e/internal/ai"
@@ -64,7 +65,13 @@ type editorDocument struct {
 	afterLoad func()
 	// pending is the session state of a document that is still loading, so
 	// a session save during loading keeps its recovery copy.
-	pending     *document.Snapshot
+	pending *document.Snapshot
+	// fromSession is set while a tab restored without unsaved text loads its
+	// file; if the file is gone, the tab closes instead of becoming new.
+	fromSession bool
+	// recovered marks unsaved text restored from an earlier session, until
+	// it is saved or discarded.
+	recovered   bool
 	closed      bool
 	revision    uint64
 	bulkEdit    bool
@@ -174,6 +181,7 @@ func (w *window) newDocument(snapshot *document.Snapshot) *editorDocument {
 		doc.newline = snapshot.Newline
 		pending := *snapshot
 		doc.pending = &pending
+		doc.recovered = snapshot.Modified
 		if len(snapshot.Text) > 0 || snapshot.Modified || snapshot.Path == "" {
 			savedModTime := snapshot.ModTime
 			doc.insertChunks(snapshot.Text, snapshot.Modified, snapshot.Cursor, nil, func(complete bool) {
@@ -182,6 +190,7 @@ func (w *window) newDocument(snapshot *document.Snapshot) *editorDocument {
 				}
 			})
 		} else {
+			doc.fromSession = true
 			doc.load(snapshot.Path, snapshot.Cursor)
 		}
 	} else {
@@ -351,16 +360,41 @@ func (d *editorDocument) title() string {
 	return filepath.Base(d.path)
 }
 
+// unsavedIcon marks a tab whose text differs from its file.
+const unsavedIcon = "media-record-symbolic"
+
 func (d *editorDocument) updatePresentation() {
-	title := d.title()
-	if d.buffer.Modified() {
-		title += " •"
+	modified := d.buffer.Modified()
+	if !modified && !d.loading {
+		d.recovered = false
 	}
-	d.page.SetTitle(title)
+	d.page.SetTitle(d.title())
 	d.page.SetTooltip(d.path)
+	switch {
+	case d.recovered:
+		d.page.SetIndicatorIcon(gio.NewThemedIcon(unsavedIcon))
+		d.page.SetIndicatorTooltip("Unsaved changes from an earlier session")
+	case modified:
+		d.page.SetIndicatorIcon(gio.NewThemedIcon(unsavedIcon))
+		d.page.SetIndicatorTooltip("Unsaved changes")
+	default:
+		d.page.SetIndicatorIcon(nil)
+		d.page.SetIndicatorTooltip("")
+	}
+	// The tab bar underlines such a tab, and lights its edge while the tab
+	// is scrolled out of view.
+	d.page.SetNeedsAttention(d.recovered)
 	if d.window.active() == d {
 		d.window.updateTitle(d)
 	}
+}
+
+// unsaved reports whether closing the tab would lose text.
+func (d *editorDocument) unsaved() bool {
+	if d.loading {
+		return d.pending != nil && (d.pending.Modified || d.pending.Path == "" && len(d.pending.Text) > 0)
+	}
+	return d.buffer.Modified()
 }
 
 func (d *editorDocument) load(path string, cursor int) {
@@ -382,6 +416,8 @@ func (d *editorDocument) load(path string, cursor int) {
 			props, err = editorconfig.Resolve(file.Path)
 		}
 		dispatch.Main(func() {
+			fromSession := d.fromSession
+			d.fromSession = false
 			if d.closed {
 				operation.Cancel()
 				return
@@ -392,6 +428,15 @@ func (d *editorDocument) load(path string, cursor int) {
 				d.afterLoad = nil
 				d.view.Widget.SetEditable(true)
 				d.page.SetLoading(false)
+				if errors.Is(err, fs.ErrNotExist) && fromSession {
+					// A restored tab without unsaved text whose file is gone
+					// would otherwise come back as an empty new file forever.
+					operation.Finish("no longer exists", "", false)
+					d.window.toast(fmt.Sprintf("“%s” no longer exists", filepath.Base(path)))
+					d.path = ""
+					d.window.tabs.ClosePage(d.page)
+					return
+				}
 				if errors.Is(err, fs.ErrNotExist) {
 					// A missing path opens as a new, empty file with that name.
 					d.path, d.modTime = path, 0

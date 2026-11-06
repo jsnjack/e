@@ -39,6 +39,16 @@ editing, EditorConfig support, and availability-aware AI autocomplete.
   unless the sidebar's `show_hidden_files` switch is on.
 - With no tab open, the editor area shows an empty state instead of an
   untitled file. This happens after `e <folder>` and after the last tab closes.
+- Each folder keeps its own session of tabs. The folder is the open project,
+  or, in a window without one, the Git root or folder of the first file
+  opened. Opening another project saves and closes the current tabs, unsaved
+  text included, and reopens that project's tabs; a window without a folder
+  takes its tabs along instead. `e` without arguments reopens the last
+  folder. A restored tab whose file is gone closes unless it holds unsaved
+  text, and empty untitled tabs are not saved.
+- Unsaved tabs carry a dot indicator. Unsaved text restored from an earlier
+  session also underlines its tab until it is saved or discarded. Close
+  Saved Tabs closes every other tab.
 - Unsaved text reaches the session a few seconds after each edit, and a tab
   that is still loading keeps its last session state.
 - `internal/source` is the small dynamic cgo bridge to GtkSourceView 5 and
@@ -47,6 +57,8 @@ editing, EditorConfig support, and availability-aware AI autocomplete.
 - `internal/gtktest` renders live widgets to pixels for `make test-ui`.
 - `internal/document` owns file metadata, atomic saves, session recovery, and
   bounded context extraction. The GTK buffer remains the only live full copy.
+  Sessions live under `sessions/` in the state directory, one per folder, and
+  `sessions/last.json` names the last one.
 - `internal/ai` owns OpenAI-compatible completion providers, ordered failover,
   availability state, cancellation, caching, and response cleanup.
 - `internal/activity` is the GTK-free, non-blocking operation event hub. The UI
@@ -71,7 +83,8 @@ editing, EditorConfig support, and availability-aware AI autocomplete.
 - `packaging/e.spec` packages the prebuilt binary as an RPM. `make release`
   builds the RPM and tarball into `dist/` and publishes them with grm.
 - `make test-ui` exercises GTK actions, shortcuts, tabs, editing, disk I/O, the
-  file tree, the path picker, change bars, folder search, and Markdown preview.
+  file tree, the path picker, change bars, folder search, per-folder sessions,
+  and Markdown preview.
   `scripts/headless.sh` runs it in a private headless Weston session;
   `E_TEST_VISIBLE=1` uses the desktop instead. `E_TEST_SCREENSHOTS=<dir>`
   saves PNGs of the empty state, path picker, change bars, and folder search.

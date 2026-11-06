@@ -64,7 +64,15 @@ type window struct {
 	saveFile    func(*saveRequest) (int64, error)
 	completer   *ai.Completer
 	aiCancel    context.CancelFunc
-	restored    bool
+
+	// sessionFolder is the folder whose tabs this window keeps, or empty for
+	// none. sessionReady is set once the window has taken a session, so a
+	// save never replaces a session that was not loaded.
+	sessionFolder string
+	sessionReady  bool
+	// switchingSession closes tabs without asking: their session was just
+	// saved, unsaved text included.
+	switchingSession bool
 
 	// Session writes run in the background; sessionMu orders them and
 	// sessionWritten drops a write that is older than one already on disk.
@@ -186,6 +194,7 @@ func (w *window) build() {
 	menu.Append("Go to File or Folder…", "win.quick-open")
 	menu.Append("Open Folder…", "win.open-folder")
 	menu.Append("Save As…", "win.save-as")
+	menu.Append("Close Saved Tabs", "win.close-saved-tabs")
 	menu.Append("Find and Replace", "win.replace")
 	menu.Append("Find in Folder", "win.find-in-folder")
 	menu.Append("Markdown Preview", "win.markdown-preview")
@@ -393,6 +402,7 @@ func (w *window) registerActions() {
 			w.tabs.ClosePage(page)
 		}
 	}, "<Control>w")
+	w.action("close-saved-tabs", w.closeSavedTabs)
 	w.action("complete", func() {
 		logging.Trace("ui: completion action activated")
 		if doc := w.active(); doc != nil {
@@ -533,7 +543,12 @@ func (w *window) showSidebarView(name string) {
 
 func (w *window) showSidebar() {
 	if w.projectRoot == "" {
-		// Without an open folder, use the active file's project.
+		// Without an open folder, show the folder whose tabs the window
+		// keeps, so its tabs stay open; else the active file's project.
+		if w.sessionFolder != "" {
+			w.setProjectRoot(w.sessionFolder)
+			return
+		}
 		doc := w.active()
 		if doc == nil || doc.path == "" {
 			w.toast("Open a folder to show project files")
@@ -607,39 +622,129 @@ func (w *window) setCompleter(completer *ai.Completer) {
 	}
 }
 
+// restoreOrNew reopens the last folder's tabs when E starts without
+// arguments. A window with neither tabs nor a project gets an empty file.
 func (w *window) restoreOrNew() {
-	w.restoreSession()
-	if len(w.documents) == 0 {
+	if !w.sessionReady {
+		w.restoreLastSession()
+	}
+	if len(w.documents) == 0 && w.projectRoot == "" {
 		w.newDocument(nil)
 	}
 }
 
-// restoreSession reopens the previous tabs once per window. Opening files
-// from the command line must restore first, or the next session save would
-// delete the old recovery copies.
-func (w *window) restoreSession() {
-	logging.Trace("ui: restore session")
-	if w.restored {
+// restoreLastSession reopens the folder whose tabs were saved last, as a
+// project when it was open as one.
+func (w *window) restoreLastSession() {
+	last, err := document.LoadLastSession(w.options.Paths.StateDir)
+	if err != nil {
+		slog.Warn("restore last session", "err", err)
+	}
+	if last.Folder != "" {
+		if info, err := os.Stat(last.Folder); err != nil || !info.IsDir() {
+			logging.Trace("ui: last session folder is gone", "folder", last.Folder, "err", err)
+			last = document.LastSession{}
+		}
+	}
+	if last.Project {
+		w.setProjectRoot(last.Folder)
 		return
 	}
-	w.restored = true
-	snapshots, err := document.LoadSession(w.options.Paths.StateDir)
-	if err != nil {
-		slog.Warn("restore session", "err", err)
-		w.toast("Couldn’t restore the previous session")
+	w.switchSession(last.Folder)
+}
+
+// switchSession makes the window keep the tabs of folder. A window without
+// a folder takes its tabs along. Otherwise its tabs are saved to their own
+// folder and closed. Then the tabs saved for folder open. It reports false
+// when the current tabs could not be saved, and nothing changes.
+func (w *window) switchSession(folder string) bool {
+	if w.sessionReady && folder == w.sessionFolder {
+		return true
 	}
+	logging.Trace("ui: switch session", "from", w.sessionFolder, "to", folder, "ready", w.sessionReady)
+	if !w.sessionReady {
+		if err := document.MigrateSharedSession(w.options.Paths.StateDir); err != nil {
+			slog.Warn("migrate shared session", "err", err)
+		}
+	}
+	keep := w.sessionFolder == ""
+	if w.sessionReady {
+		var snapshots []document.Snapshot
+		if !keep {
+			snapshots = w.sessionSnapshots()
+		}
+		if err := w.writeSession(w.sessionFolder, snapshots, true); err != nil {
+			slog.Warn("save session before switching", "folder", w.sessionFolder, "err", err)
+			w.toast("Couldn’t save the open tabs: " + err.Error())
+			return false
+		}
+	}
+	if !keep {
+		w.closeAllTabs()
+	}
+	w.sessionFolder, w.sessionReady = folder, true
+	w.restoreTabs(folder, keep)
+	w.scheduleSessionSave()
+	return true
+}
+
+// restoreTabs opens the tabs saved for folder. A tab for a file that is
+// already open is skipped unless it holds unsaved text.
+func (w *window) restoreTabs(folder string, keepSelection bool) {
+	snapshots, err := document.LoadSession(document.SessionDir(w.options.Paths.StateDir, folder))
+	if err != nil {
+		slog.Warn("restore session", "folder", folder, "err", err)
+		w.toast("Couldn’t restore the previous tabs")
+	}
+	selected := w.tabs.SelectedPage()
 	var activePage *adw.TabPage
 	for i := range snapshots {
 		snapshot := snapshots[i]
+		if snapshot.Path != "" && !snapshot.Modified {
+			if open, _ := w.documentForPath(snapshot.Path); open != nil {
+				continue
+			}
+		}
 		doc := w.newDocument(&snapshot)
 		if snapshot.Active {
 			activePage = doc.page
 		}
 	}
+	if keepSelection && selected != nil {
+		activePage = selected
+	}
 	if activePage != nil {
 		w.tabs.SetSelectedPage(activePage)
 	}
-	logging.Trace("ui: session ready", "documents", len(w.documents))
+	logging.Trace("ui: session ready", "folder", folder, "documents", len(w.documents))
+}
+
+// closeAllTabs closes every tab without asking. The caller saves the
+// session first.
+func (w *window) closeAllTabs() {
+	pages := make([]*adw.TabPage, 0, w.tabs.NPages())
+	for position := 0; position < w.tabs.NPages(); position++ {
+		pages = append(pages, w.tabs.NthPage(position))
+	}
+	w.switchingSession = true
+	defer func() { w.switchingSession = false }()
+	for _, page := range pages {
+		w.tabs.ClosePage(page)
+	}
+}
+
+// closeSavedTabs closes every tab without unsaved text.
+func (w *window) closeSavedTabs() {
+	var pages []*adw.TabPage
+	for position := 0; position < w.tabs.NPages(); position++ {
+		page := w.tabs.NthPage(position)
+		if doc := w.documentForPage(page); doc != nil && !doc.unsaved() {
+			pages = append(pages, page)
+		}
+	}
+	for _, page := range pages {
+		w.tabs.ClosePage(page)
+	}
 }
 
 func (w *window) active() *editorDocument {
@@ -700,6 +805,12 @@ func (w *window) openPath(path string) {
 	if err == nil && info.IsDir() {
 		w.setProjectRoot(path)
 		return
+	}
+	if w.sessionFolder == "" {
+		// A window without a folder takes the folder of the first file.
+		if abs, absErr := filepath.Abs(path); absErr == nil {
+			w.switchSession(projectRootFor(abs, pathExists))
+		}
 	}
 	if err == nil {
 		w.rememberPath(path, false)
@@ -838,9 +949,13 @@ func (w *window) closePage(page *adw.TabPage) bool {
 			delete(w.documents, doc.page)
 		}
 		w.tabs.ClosePageFinish(page, close)
-		if close {
+		if close && !w.switchingSession {
 			w.scheduleSessionSave()
 		}
+	}
+	if w.switchingSession {
+		finish(true)
+		return true
 	}
 	if doc.loading {
 		if doc.pending != nil && doc.pending.Modified {
@@ -923,36 +1038,57 @@ func (w *window) updateTitle(doc *editorDocument) {
 	w.title.SetSubtitle(subtitle)
 }
 
-// persistSession saves the open tabs and recovery copies. Snapshots are taken
-// on the GTK thread. The write runs in the background unless wait is set; only
-// a waiting call reports its error.
+// persistSession saves the open tabs and recovery copies to the window's
+// session folder. A window that has not taken a session saves nothing.
 func (w *window) persistSession(wait bool) error {
 	if w.sessionTimer != 0 {
 		glib.SourceRemove(w.sessionTimer)
 		w.sessionTimer = 0
 	}
+	if !w.sessionReady {
+		return nil
+	}
+	return w.writeSession(w.sessionFolder, w.sessionSnapshots(), wait)
+}
+
+// sessionSnapshots captures the tabs worth restoring, in tab order. Empty
+// untitled tabs are left out.
+func (w *window) sessionSnapshots() []document.Snapshot {
 	snapshots := make([]document.Snapshot, 0, len(w.documents))
 	for index := 0; index < w.tabs.NPages(); index++ {
 		page := w.tabs.NthPage(index)
-		if doc := w.documentForPage(page); doc != nil {
-			snapshot := doc.snapshot()
-			snapshot.Active = sameTabPage(page, w.tabs.SelectedPage())
-			snapshots = append(snapshots, snapshot)
+		doc := w.documentForPage(page)
+		if doc == nil || doc.path == "" && !doc.loading && doc.buffer.CharCount() == 0 {
+			continue
 		}
+		snapshot := doc.snapshot()
+		snapshot.Active = sameTabPage(page, w.tabs.SelectedPage())
+		snapshots = append(snapshots, snapshot)
 	}
+	return snapshots
+}
+
+// writeSession saves snapshots as the tabs of folder and records folder as
+// the last session. Snapshots are taken on the GTK thread. The write runs in
+// the background unless wait is set; only a waiting call reports its error.
+func (w *window) writeSession(folder string, snapshots []document.Snapshot, wait bool) error {
 	w.sessionSeq++
 	sequence, stateDir := w.sessionSeq, w.options.Paths.StateDir
+	last := document.LastSession{Folder: folder, Project: folder != "" && folder == w.projectRoot}
 	write := func() error {
 		w.sessionMu.Lock()
 		defer w.sessionMu.Unlock()
 		if sequence <= w.sessionWritten {
 			return nil
 		}
-		err := document.SaveSession(stateDir, snapshots)
-		if err == nil {
-			w.sessionWritten = sequence
+		if err := document.SaveSession(document.SessionDir(stateDir, folder), snapshots); err != nil {
+			return err
 		}
-		return err
+		if err := document.SaveLastSession(stateDir, last); err != nil {
+			return err
+		}
+		w.sessionWritten = sequence
+		return nil
 	}
 	if wait {
 		return write()
