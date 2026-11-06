@@ -85,9 +85,14 @@ editing, EditorConfig support, and availability-aware AI autocomplete.
 - `make test-ui` exercises GTK actions, shortcuts, tabs, editing, disk I/O, the
   file tree, the path picker, change bars, folder search, per-folder sessions,
   and Markdown preview.
-  `scripts/headless.sh` runs it in a private headless Weston session;
+  `scripts/headless.sh` runs it in a private headless Weston session with
+  its own runtime directory and D-Bus session bus;
   `E_TEST_VISIBLE=1` uses the desktop instead. `E_TEST_SCREENSHOTS=<dir>`
   saves PNGs of the empty state, path picker, change bars, and folder search.
+  Run every ad hoc GUI command through `scripts/headless.sh` too, never a
+  hand-written `dbus-run-session`: a bus that can start the document portal
+  while sharing `/run/user/$UID` unmounts the desktop's `doc` filesystem, and
+  Flatpak apps then fail to start.
 
 The editor must remain interactive with a 5 MB highlighted document. Never run
 network or process I/O on the GTK thread, never copy the whole document on each
